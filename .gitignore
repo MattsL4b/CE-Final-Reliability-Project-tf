@@ -1,0 +1,40 @@
+*venv*/
+__pycache__
+
+# ---- Secrets — never commit ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.tfvars
+!*.tfvars.example
+credentials
+aws.json
+
+# --- Terraform ----
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+# keep .terraform.lock.hcl committed — pins provider versions for the team
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# ---- Logs / scratch ----
+*.log
+/tmp/
+scratch/
