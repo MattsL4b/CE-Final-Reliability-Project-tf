@@ -3,22 +3,22 @@ provider "aws" {
 }
 
 # ---- VPC AND SUBNETS ---
-# find vpc
-data "aws_vpc" "existing" {
-    default = true
-}
+# # find vpc
+# data "aws_vpc" "existing" {
+#     default = true
+# }
 
-# Fetch all private subnets inside that VPC across your eu-west-2 AZs
-data "aws_subnets" "private" {
-    filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.existing.id]
-    }
-    filter {
-    name   = "availability-zone"
-    values = ["eu-west-2a", "eu-west-2b", "eu-west-2c"]
-    }
-}
+# # Fetch all private subnets inside that VPC across your eu-west-2 AZs
+# data "aws_subnets" "private" {
+#     filter {
+#     name   = "vpc-id"
+#     values = [data.aws_vpc.existing.id]
+#     }
+#     filter {
+#     name   = "availability-zone"
+#     values = ["eu-west-2a", "eu-west-2b", "eu-west-2c"]
+#     }
+# }
 
 
 # ---- IAM ROLE POLICY -----
@@ -83,7 +83,7 @@ resource "aws_iam_role_policy_attachment" "attach_cache_policy" {
 resource "aws_lambda_function" "proxy_shield" {
     filename       = "lambda_payload.zip"
     function_name  =  "hosp_proxy_shield"
-    role           =  aws_iam_role_exec.arn
+    role           =  aws_iam_role.lambda_exec.arn
     handler        = "index.lambda_handler"
     runtime        = "python3.12"
     timeout        =  10
@@ -96,3 +96,6 @@ resource "aws_lambda_function" "proxy_shield" {
         }
     }
 }
+
+# fmt
+# put the tf state in the bucket somehow
