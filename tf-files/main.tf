@@ -20,31 +20,7 @@ data "aws_subnets" "private" {
     }
 }
 
-# ---- IAM USER ----
-resource "aws_iam_user" "tf" {
-    name = "may26-tf"
-    tags = {
-        team = "may26"
-        purpose = "terraform"
-    }
-}
 
-resource "aws_iam_user_group_membership" "tf" {
-    user = aws_iam_user.tf.name
-    groups = ["students"]
-}
-
-resource "aws_iam_access_key" "tf" {
-    user = aws_iam_user.tf.name
-}
-
-output "may26_tf_access_key_id" {
-    value = aws_iam_access_key.tf.id
-}
-
-output "may26_tf_secret_access_key" {
-    value = aws_iam_access_key.tf.secret
-    sensitive = true
 }
 
 
