@@ -57,7 +57,7 @@ resource "aws_iam_policy" "lambda_dynamodb_cache" {
                 "dynamodb:PutItem",
                 "dynamodb:DeleteItem"
             ]
-            Resource = aws_dynamodb_table.api_cache.arn # Scoped strictly to your cache table
+            Resource = aws_dynamodb_table.cache.arn
         },
         {
             Effect = "Allow"
@@ -78,4 +78,21 @@ resource "aws_iam_role_policy_attachment" "attach_cache_policy" {
     policy_arn = aws_iam_policy.lambda_dynamodb_cache.arn
 }
 
-# ---- LAMBDA
+# ---- LAMBDA / ENV -----
+
+resource "aws_lambda_function" "proxy_shield" {
+    filename       = "lambda_payload.zip"
+    function_name  =  "hosp_proxy_shield"
+    role           =  aws_iam_role_exec.arn
+    handler        = "index.lambda_handler"
+    runtime        = "python3.12"
+    timeout        =  10
+
+    environment {
+        variables = {
+            CACHE_TABLE_NAME    = aws_dynamodb_table.cache.name
+            HOSP_BACKEND_URL    = "http://13.40.197.254"
+            CACHE_TTL_SECONDS   = 20
+        }
+    }
+}
