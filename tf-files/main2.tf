@@ -32,6 +32,7 @@ data "archive_file" "proxy_payload" {
   type        = "zip"
   source_dir  = "${path.module}/lambda_src"
   output_path = "${path.module}/lambda_payload.zip"
+  excludes    = ["__pycache__", "__pycache__/*"]
 }
 
 # ==========================================
@@ -49,7 +50,7 @@ resource "aws_dynamodb_table" "cache" {
   }
 
   ttl {
-    attribute_name = "ttl"
+    attribute_name = "expires_at"
     enabled        = true
   }
 
@@ -117,7 +118,7 @@ resource "aws_iam_role_policy_attachment" "attach_cache_policy" {
 # Grants permissions to create ENIs inside the VPC
 resource "aws_iam_role_policy_attachment" "lambda_vpc_access" {
   role       = aws_iam_role.lambda_exec.name
-  policy_arn = "arn:aws:iam::aws:policy/service/role/AWSLambdaVPCAccessExecutionRole"
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
 # ==========================================
@@ -129,19 +130,19 @@ resource "aws_security_group" "lambda_sg" {
   description = "Security group for Lambda proxy shield"
   vpc_id      = "vpc-080dbb0b7dc86503a"
 
-  # Outbound HTTP access to HOSP private IP
-  egress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["172.31.39.164/32"]
+  ingress {
+    from_port = 443
+    to_port   = 443
+    protocol  = "tcp"
+    self      = true
   }
 
-  # Outbound HTTPS for AWS Services (CloudWatch, IAM, etc.)
+
+  # Outbound to HOSP, the VPC DNS resolver, and AWS service endpoints
   egress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
@@ -155,11 +156,27 @@ resource "aws_vpc_endpoint" "dynamodb" {
   vpc_id            = "vpc-080dbb0b7dc86503a"
   service_name      = "com.amazonaws.eu-west-2.dynamodb"
   vpc_endpoint_type = "Gateway"
+  route_table_ids   = ["rtb-0020e3ad9b254dde8"]
 
   tags = {
     Name = "dynamodb-vpc-endpoint"
   }
 }
+
+# Interface endpoint so the VPC Lambda can ship logs to CloudWatch
+resource "aws_vpc_endpoint" "logs" {
+  vpc_id              = "vpc-080dbb0b7dc86503a"
+  service_name        = "com.amazonaws.eu-west-2.logs"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = ["subnet-09f2ffa366a8abe67", "subnet-0fc0a94296b831a31"]
+  security_group_ids  = [aws_security_group.lambda_sg.id]
+  private_dns_enabled = true
+
+  tags = {
+    Name = "logs-vpc-endpoint"
+  }
+}
+
 
 # ==========================================
 # 5. ALB TARGET GROUP & CANARY ROUTING
@@ -257,9 +274,10 @@ resource "aws_lambda_function" "proxy_shield" {
 
   environment {
     variables = {
-      CACHE_TABLE_NAME  = aws_dynamodb_table.cache.name
-      HOSP_BACKEND_URL  = "http://172.31.39.164"
-      CACHE_TTL_SECONDS = "20" # Enforced as string
+      CACHE_TABLE_NAME    = aws_dynamodb_table.cache.name
+      HOSP_BACKEND_URL    = "http://172.31.39.164"
+      CACHE_TTL_SECONDS   = "20" # Enforced as string
+      RETRY_WRITES_ON_5XX = "true"
     }
   }
 
