@@ -1,0 +1,659 @@
+import os
+import time
+import json
+import hashlib
+import urllib.request
+import urllib.error
+import urllib.parse
+
+import boto3
+
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------------------------
+
+HOSP_BASE_URL = os.environ["HOSP_BACKEND_URL"].rstrip("/")
+#changed name below from chache_table_name
+CACHE_TABLE_NAME = os.environ["CACHE_TABLE_NAME"]
+
+CACHE_TTL_SECONDS = int(
+    os.environ.get("CACHE_TTL_SECONDS", "30")
+)
+
+RETRY_WRITES_ON_5XX = (
+    os.environ.get("RETRY_WRITES_ON_5XX", "false").lower() == "true"
+)
+
+# One normal request + one retry.
+MAX_ATTEMPTS = 2
+
+# HOSP has already been observed taking several seconds to respond.
+UPSTREAM_TIMEOUT_SECONDS = 12
+
+# Small delay before retrying.
+RETRY_DELAY_SECONDS = 0.2
+
+
+# Create the DynamoDB resource outside the handler.
+# Lambda can reuse this object across warm invocations.
+dynamodb = boto3.resource("dynamodb")
+cache_table = dynamodb.Table(CACHE_TABLE_NAME)
+
+
+# ---------------------------------------------------------------------------
+# LAMBDA HANDLER
+# ---------------------------------------------------------------------------
+
+def lambda_handler(event, context):
+    """
+    Entry point called by AWS Lambda.
+
+    Takes the ALB request event, checks the cache for GET requests,
+    forwards requests to HOSP where necessary, and returns an
+    ALB-compatible response.
+    """
+
+    method = event.get("httpMethod", "GET").upper()
+    path = event.get("path", "/")
+    query_params = event.get("queryStringParameters") or {}
+    incoming_headers = event.get("headers") or {}
+    body = event.get("body")
+
+    # -----------------------------------------------------------------------
+    # AUTHENTICATION
+    # -----------------------------------------------------------------------
+
+    # Header names are case-insensitive, but AWS may represent them using
+    # different casing.
+    authorization = (
+        incoming_headers.get("authorization")
+        or incoming_headers.get("Authorization")
+    )
+
+    if not authorization:
+        return build_response(
+            status_code=401,
+            body=json.dumps({
+                "error": "Authentication required"
+            }),
+            cache_status="BYPASS"
+        )
+
+    # -----------------------------------------------------------------------
+    # GET REQUESTS: CHECK CACHE FIRST
+    # -----------------------------------------------------------------------
+
+    cache_key = None
+
+    if method == "GET":
+
+        cache_key = build_cache_key(
+            authorization,
+            path,
+            query_params
+        )
+
+        cached_body = get_from_cache(cache_key)
+
+        if cached_body is not None:
+
+            print(
+                f"CACHE HIT method={method} path={path}"
+            )
+
+            return build_response(
+                status_code=200,
+                body=cached_body,
+                cache_status="HIT"
+            )
+
+        print(
+            f"CACHE MISS method={method} path={path}"
+        )
+
+    # -----------------------------------------------------------------------
+    # CALL HOSP
+    # -----------------------------------------------------------------------
+
+    response_body, status_code = fetch_from_hosp(
+        method=method,
+        path=path,
+        query_params=query_params,
+        incoming_headers=incoming_headers,
+        authorization=authorization,
+        body=body
+    )
+
+    # -----------------------------------------------------------------------
+    # CACHE SUCCESSFUL GET RESPONSES
+    # -----------------------------------------------------------------------
+
+    if method == "GET" and status_code == 200:
+
+        save_to_cache(
+            key=cache_key,
+            body=response_body,
+            ttl_seconds=CACHE_TTL_SECONDS
+        )
+
+    # -----------------------------------------------------------------------
+    # INVALIDATE CACHE AFTER SUCCESSFUL WRITES
+    # -----------------------------------------------------------------------
+
+    if (
+        method in {"POST", "PUT", "PATCH", "DELETE"}
+        and status_code in {200, 201, 204}
+    ):
+        invalidate_related_cache(path)
+
+    return build_response(
+        status_code=status_code,
+        body=response_body,
+        cache_status="MISS" if method == "GET" else "BYPASS"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CACHE KEY
+# ---------------------------------------------------------------------------
+
+def build_cache_key(authorization, path, query_params):
+    """
+    Creates a cache key unique to both:
+        - the authenticated caller
+        - the requested resource
+
+    We hash the Authorization header so credentials themselves are never
+    written to DynamoDB.
+
+    Example conceptual key:
+
+        7e63ab...:/notes?patient_id=3
+    """
+
+    caller_hash = hashlib.sha256(
+        authorization.encode("utf-8")
+    ).hexdigest()
+
+    query_string = urllib.parse.urlencode(
+        sorted(query_params.items())
+    )
+
+    resource = path
+
+    if query_string:
+        resource = f"{path}?{query_string}"
+
+    return f"{caller_hash}:{resource}"
+
+
+# ---------------------------------------------------------------------------
+# CACHE READ
+# ---------------------------------------------------------------------------
+
+def get_from_cache(key):
+    """
+    Attempts to retrieve a cached response from DynamoDB.
+
+    DynamoDB TTL deletion is asynchronous, so an expired item might remain
+    in the table for some time. We therefore check ttl_timestamp ourselves
+    before using the value.
+    """
+
+    try:
+
+        response = cache_table.get_item(
+            Key={
+                "cache_key": key
+            }
+        )
+
+        item = response.get("Item")
+
+        if not item:
+            return None
+
+        expires_at = int(item["expires_at"])
+        current_time = int(time.time())
+
+        if expires_at <= current_time:
+            return None
+
+        # Keep this as a string because ALB expects body to be a string.
+        return item["data"]
+
+    except Exception as error:
+
+        # Cache failure should not make the HOSP service unavailable.
+        print(
+            "CACHE READ ERROR "
+            f"type={type(error).__name__}"
+        )
+
+        return None
+
+
+# ---------------------------------------------------------------------------
+# CACHE WRITE
+# ---------------------------------------------------------------------------
+
+def save_to_cache(key, body, ttl_seconds):
+    """
+    Saves a successful GET response in DynamoDB.
+    """
+
+    try:
+
+        expires_at = int(time.time()) + ttl_seconds
+
+        cache_table.put_item(
+            Item={
+                "cache_key": key,
+                "data": body,
+                "expires_at": expires_at
+            }
+        )
+
+    except Exception as error:
+
+        # Caching is an optimisation. A failed cache write should not
+        # turn a successful HOSP response into a failed user request.
+        print(
+            "CACHE WRITE ERROR "
+            f"type={type(error).__name__}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# CACHE INVALIDATION
+# ---------------------------------------------------------------------------
+
+def invalidate_related_cache(path):
+    """
+    Removes cached entries which may now be stale after a successful write.
+
+    Because cache keys contain a caller hash, and because multiple query
+    variants can exist, invalidation requires looking for cache keys
+    containing the relevant resource prefix.
+
+    This uses a DynamoDB scan.
+
+    That would not be desirable for a large production cache, but is
+    acceptable as an initial bootcamp implementation with a small table.
+
+    A production design would likely use a better cache-versioning or
+    invalidation strategy.
+    """
+
+    # Work out the collection/resource that may have changed.
+    #
+    # Examples:
+    #   /notes/12     -> /notes
+    #   /patients/3   -> /patients
+    #   /hospitals/4  -> /hospitals
+
+    parts = path.strip("/").split("/")
+
+    if not parts or not parts[0]:
+        return
+
+    base_path = f"/{parts[0]}"
+
+    try:
+
+        response = cache_table.scan(
+            ProjectionExpression="cache_key"
+        )
+
+        while True:
+
+            for item in response.get("Items", []):
+
+                key = item["cache_key"]
+
+                # Cache keys look like:
+                #
+                # <caller hash>:/notes
+                # <caller hash>:/notes?patient_id=3
+                # <caller hash>:/notes/12
+
+                resource = key.split(":", 1)[-1]
+
+                if (
+                    resource == base_path
+                    or resource.startswith(base_path + "?")
+                    or resource.startswith(base_path + "/")
+                ):
+
+                    cache_table.delete_item(
+                        Key={
+                            "cache_key": key
+                        }
+                    )
+
+            last_key = response.get(
+                "LastEvaluatedKey"
+            )
+
+            if not last_key:
+                break
+
+            response = cache_table.scan(
+                ProjectionExpression="cache_key",
+                ExclusiveStartKey=last_key
+            )
+
+        print(
+            f"CACHE INVALIDATED base_path={base_path}"
+        )
+
+    except Exception as error:
+
+        # Again: failure of the cache should not fail the user's write.
+        print(
+            "CACHE INVALIDATION ERROR "
+            f"type={type(error).__name__}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# HOSP REQUEST
+# ---------------------------------------------------------------------------
+
+def fetch_from_hosp(
+    method,
+    path,
+    query_params,
+    incoming_headers,
+    authorization,
+    body=None
+):
+    """
+    Forwards a request to the legacy HOSP backend.
+
+    Retry policy:
+
+        GET:
+            Retry once on:
+                - HTTP 500
+                - HTTP 503
+                - connection failure
+                - timeout
+
+        POST / PUT / PATCH / DELETE:
+            By default, do NOT retry.
+
+            If RETRY_WRITES_ON_5XX=true, retry a 500 or 503 once.
+
+            We deliberately do not automatically retry writes after
+            ambiguous network failures/timeouts because HOSP may already
+            have committed the change.
+    """
+
+    url = f"{HOSP_BASE_URL}{path}"
+
+    if query_params:
+
+        query_string = urllib.parse.urlencode(
+            query_params
+        )
+
+        url += f"?{query_string}"
+
+    # -----------------------------------------------------------------------
+    # HEADERS
+    # -----------------------------------------------------------------------
+
+    outgoing_headers = {
+        "Authorization": authorization,
+        "Accept": "application/json"
+    }
+
+    # Preserve Content-Type for POST/PATCH/etc.
+    content_type = (
+        incoming_headers.get("content-type")
+        or incoming_headers.get("Content-Type")
+    )
+
+    if content_type:
+        outgoing_headers["Content-Type"] = content_type
+
+    # -----------------------------------------------------------------------
+    # BODY
+    # -----------------------------------------------------------------------
+
+    request_body = None
+
+    if body is not None:
+
+        # ALB normally gives Lambda the request body as a string.
+        request_body = body.encode("utf-8")
+
+    # -----------------------------------------------------------------------
+    # ATTEMPTS
+    # -----------------------------------------------------------------------
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+
+        request = urllib.request.Request(
+            url=url,
+            data=request_body,
+            headers=outgoing_headers,
+            method=method
+        )
+
+        try:
+
+            print(
+                f"HOSP REQUEST "
+                f"method={method} "
+                f"path={path} "
+                f"attempt={attempt}"
+            )
+
+            with urllib.request.urlopen(
+                request,
+                timeout=UPSTREAM_TIMEOUT_SECONDS
+            ) as response:
+
+                response_body = (
+                    response.read().decode("utf-8")
+                )
+
+                print(
+                    f"HOSP RESPONSE "
+                    f"method={method} "
+                    f"path={path} "
+                    f"status={response.status} "
+                    f"attempt={attempt}"
+                )
+
+                return (
+                    response_body,
+                    response.status
+                )
+
+        # -------------------------------------------------------------------
+        # HOSP RETURNED AN HTTP ERROR
+        # -------------------------------------------------------------------
+
+        except urllib.error.HTTPError as error:
+
+            status_code = error.code
+            error_body = (
+                error.read().decode("utf-8")
+            )
+
+            print(
+                f"HOSP HTTP ERROR "
+                f"method={method} "
+                f"path={path} "
+                f"status={status_code} "
+                f"attempt={attempt}"
+            )
+
+            transient_error = (
+                status_code in {500, 503}
+            )
+
+            attempts_remaining = (
+                attempt < MAX_ATTEMPTS
+            )
+
+            # GET requests are safe to repeat.
+            if (
+                method == "GET"
+                and transient_error
+                and attempts_remaining
+            ):
+
+                print(
+                    f"RETRYING GET path={path}"
+                )
+
+                time.sleep(
+                    RETRY_DELAY_SECONDS
+                )
+
+                continue
+
+            # Optional write retry.
+            if (
+                method in {"POST", "PUT", "PATCH", "DELETE"}
+                and RETRY_WRITES_ON_5XX
+                and transient_error
+                and attempts_remaining
+            ):
+
+                print(
+                    f"RETRYING WRITE "
+                    f"method={method} "
+                    f"path={path}"
+                )
+
+                time.sleep(
+                    RETRY_DELAY_SECONDS
+                )
+
+                continue
+
+            # Return HOSP's actual HTTP error.
+            return (
+                error_body,
+                status_code
+            )
+
+        # -------------------------------------------------------------------
+        # NETWORK / DNS / CONNECTION FAILURE
+        # -------------------------------------------------------------------
+
+        except urllib.error.URLError:
+
+            print(
+                f"HOSP CONNECTION ERROR "
+                f"method={method} "
+                f"path={path} "
+                f"attempt={attempt}"
+            )
+
+            # A GET can safely be repeated.
+            if (
+                method == "GET"
+                and attempt < MAX_ATTEMPTS
+            ):
+
+                time.sleep(
+                    RETRY_DELAY_SECONDS
+                )
+
+                continue
+
+            # For a write, we don't know whether HOSP performed the action.
+            return (
+                json.dumps({
+                    "error": "Unable to contact HOSP"
+                }),
+                502
+            )
+
+        # -------------------------------------------------------------------
+        # TIMEOUT
+        # -------------------------------------------------------------------
+
+        except TimeoutError:
+
+            print(
+                f"HOSP TIMEOUT "
+                f"method={method} "
+                f"path={path} "
+                f"attempt={attempt}"
+            )
+
+            if (
+                method == "GET"
+                and attempt < MAX_ATTEMPTS
+            ):
+
+                time.sleep(
+                    RETRY_DELAY_SECONDS
+                )
+
+                continue
+
+            return (
+                json.dumps({
+                    "error": "HOSP timed out"
+                }),
+                504
+            )
+
+    # Should normally never reach here.
+    return (
+        json.dumps({
+            "error": "Unexpected proxy failure"
+        }),
+        502
+    )
+
+
+# ---------------------------------------------------------------------------
+# ALB RESPONSE
+# ---------------------------------------------------------------------------
+
+def build_response(
+    status_code,
+    body,
+    cache_status
+):
+    """
+    Formats a response in the structure expected by an ALB Lambda target.
+
+    X-Proxy-Cache makes testing easier in Insomnia:
+
+        HIT
+            Response came from DynamoDB.
+
+        MISS
+            Cache did not contain the response, so HOSP was contacted.
+
+        BYPASS
+            Request was not eligible for caching.
+    """
+
+    # ALB requires the body to be a string.
+    if body is None:
+        body = ""
+
+    elif not isinstance(body, str):
+        body = json.dumps(body)
+
+    return {
+        "isBase64Encoded": False,
+        "statusCode": status_code,
+        "headers": {
+            "Content-Type": "application/json",
+            "X-Proxy-Cache": cache_status
+        },
+        "body": body
+    }
