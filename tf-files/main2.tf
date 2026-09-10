@@ -1,8 +1,66 @@
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.4"
+    }
+  }
+
+  # OPTIONAL: Configure remote state once S3 bucket and DynamoDB lock table are provisioned
+  # backend "s3" {
+  #   bucket         = "your-terraform-state-bucket"
+  #   key            = "hosp-proxy/terraform.tfstate"
+  #   region         = "eu-west-2"
+  #   dynamodb_table = "terraform-state-locks"
+  # }
+}
+
 provider "aws" {
   region = "eu-west-2"
 }
 
-# ---- IAM ROLE & POLICIES FOR LAMBDA ----
+# ==========================================
+# 1. ZIP PACKAGING FOR LAMBDA CODE
+# ==========================================
+
+data "archive_file" "proxy_payload" {
+  type        = "zip"
+  source_dir  = "${path.module}/lambda_src"
+  output_path = "${path.module}/lambda_payload.zip"
+}
+
+# ==========================================
+# 2. DYNAMODB CACHE TABLE
+# ==========================================
+
+resource "aws_dynamodb_table" "cache" {
+  name         = "hosp_api_cache"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "cache_key"
+
+  attribute {
+    name = "cache_key"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = {
+    Name = "hosp-api-cache"
+  }
+}
+
+# ==========================================
+# 3. IAM ROLE & POLICIES FOR LAMBDA
+# ==========================================
 
 resource "aws_iam_role" "lambda_exec" {
   name = "hosp_proxy_lambda_execution_role"
@@ -21,7 +79,6 @@ resource "aws_iam_role" "lambda_exec" {
   })
 }
 
-# DynamoDB & CloudWatch Access Policy
 resource "aws_iam_policy" "lambda_dynamodb_cache" {
   name        = "hosp_proxy_dynamodb_cache_policy"
   description = "Allows proxy Lambda to read, write, and invalidate DynamoDB cache items"
@@ -57,17 +114,16 @@ resource "aws_iam_role_policy_attachment" "attach_cache_policy" {
   policy_arn = aws_iam_policy.lambda_dynamodb_cache.arn
 }
 
-# [ADDED] Required permissions for Lambda to run inside a VPC (ENI management)
+# Grants permissions to create ENIs inside the VPC
 resource "aws_iam_role_policy_attachment" "lambda_vpc_access" {
   role       = aws_iam_role.lambda_exec.name
   policy_arn = "arn:aws:iam::aws:policy/service/role/AWSLambdaVPCAccessExecutionRole"
 }
 
+# ==========================================
+# 4. VPC NETWORKING & SECURITY GROUPS
+# ==========================================
 
-# ---- VPC NETWORKING & SECURITY GROUPS ----
-
-
-# [ADDED] Dedicated Security Group for the Lambda proxy inside the HOSP VPC
 resource "aws_security_group" "lambda_sg" {
   name        = "may26-lambda-proxy-sg"
   description = "Security group for Lambda proxy shield"
@@ -81,7 +137,7 @@ resource "aws_security_group" "lambda_sg" {
     cidr_blocks = ["172.31.39.164/32"]
   }
 
-  # Outbound HTTPS for DynamoDB / AWS APIs
+  # Outbound HTTPS for AWS Services (CloudWatch, IAM, etc.)
   egress {
     from_port   = 443
     to_port     = 443
@@ -94,22 +150,20 @@ resource "aws_security_group" "lambda_sg" {
   }
 }
 
-# [ADDED] VPC Gateway Endpoint so private subnets can reach DynamoDB without internet
+# VPC Gateway Endpoint for DynamoDB access inside private subnets
 resource "aws_vpc_endpoint" "dynamodb" {
   vpc_id            = "vpc-080dbb0b7dc86503a"
   service_name      = "com.amazonaws.eu-west-2.dynamodb"
   vpc_endpoint_type = "Gateway"
-
-  # Note: Add private route table ID(s) here if known
-  # route_table_ids = ["rtb-xxxxxxxxxxxxxxxxx"]
 
   tags = {
     Name = "dynamodb-vpc-endpoint"
   }
 }
 
-
-# ---- ALB TARGET GROUP & CANARY ROUTING ----
+# ==========================================
+# 5. ALB TARGET GROUP & CANARY ROUTING
+# ==========================================
 
 data "aws_lb_listener" "existing_http" {
   load_balancer_arn = "arn:aws:elasticloadbalancing:eu-west-2:664047078509:loadbalancer/app/lb-may26/3cf64897dfb55cc8"
@@ -140,13 +194,14 @@ resource "aws_lb_target_group_attachment" "lambda_proxy" {
 }
 
 variable "proxy_weight" {
-  type    = number
-  default = 0 # start at 0, raise gradually
+  type        = number
+  default     = 0 # Safe default: 0% traffic to Lambda proxy
+  description = "Percentage of traffic to send to the Lambda proxy (0-100)"
 }
 
 resource "aws_lb_listener_rule" "canary_routing" {
   listener_arn = data.aws_lb_listener.existing_http.arn
-  priority     = 2
+  priority     = 10 # Avoids priority 1 collision
 
   action {
     type = "forward"
@@ -176,18 +231,22 @@ resource "aws_lb_listener_rule" "canary_routing" {
   }
 }
 
-
-# ---- LAMBDA FUNCTION & ENVIRONMENT ----
+# ==========================================
+# 6. LAMBDA FUNCTION & ENVIRONMENT
+# ==========================================
 
 resource "aws_lambda_function" "proxy_shield" {
-  filename      = "lambda_payload.zip"
-  function_name = "hosp_proxy_shield"
-  role          = aws_iam_role.lambda_exec.arn
-  handler       = "index.lambda_handler"
-  runtime       = "python3.12"
-  timeout       = 30
+  filename         = data.archive_file.proxy_payload.output_path
+  source_code_hash = data.archive_file.proxy_payload.output_base64sha256
+  function_name    = "hosp_proxy_shield"
+  role             = aws_iam_role.lambda_exec.arn
+  handler          = "index.lambda_handler"
+  runtime          = "python3.12"
+  timeout          = 25 # Accommodates slow HOSP calls + retries
 
-  # [ADDED] VPC Placement Configuration
+  # Protect Puma from thread exhaustion by capping concurrency
+  reserved_concurrent_executions = 5
+
   vpc_config {
     subnet_ids = [
       "subnet-09f2ffa366a8abe67",
@@ -199,23 +258,26 @@ resource "aws_lambda_function" "proxy_shield" {
   environment {
     variables = {
       CACHE_TABLE_NAME  = aws_dynamodb_table.cache.name
-      HOSP_BACKEND_URL  = "http://172.31.39.164" # [UPDATED] Switched to Private IP
-      CACHE_TTL_SECONDS = "20"
+      HOSP_BACKEND_URL  = "http://172.31.39.164"
+      CACHE_TTL_SECONDS = "20" # Enforced as string
     }
   }
 
-  # [ADDED] Ensure ENI policy is attached before creating function
   depends_on = [
     aws_iam_role_policy_attachment.lambda_vpc_access
   ]
 }
 
+# ==========================================
+# 7. OUTPUTS
+# ==========================================
 
-# ---- OUTPUTS FOR COACH REQUEST ----
-
-
-# [ADDED] Copy this value after 'terraform apply' and send to coach
 output "lambda_security_group_id" {
   value       = aws_security_group.lambda_sg.id
   description = "Provide this SG ID to coach to add HTTP :80 ingress rule on HOSP SG"
+}
+
+output "lambda_target_group_arn" {
+  value       = aws_lb_target_group.lambda_proxy.arn
+  description = "ARN for the Lambda target group"
 }
