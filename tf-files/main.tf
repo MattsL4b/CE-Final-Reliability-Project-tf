@@ -116,7 +116,7 @@ resource "aws_lb_target_group_attachment" "lambda_proxy" {
 
 variable "proxy_weight" {
   type    = number
-  default = 5 # start at 0, raise gradually
+  default = 0 # start at 0, raise gradually
 }
 
 resource "aws_lb_listener_rule" "canary_routing" {
