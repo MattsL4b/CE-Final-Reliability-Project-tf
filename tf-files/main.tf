@@ -80,32 +80,75 @@ resource "aws_iam_role_policy_attachment" "attach_cache_policy" {
 
 # ---- CANARY & LISTENING RULES ----
 
+
+data "aws_lb_listener" "existing_http" {
+  load_balancer_arn = "arn:aws:elasticloadbalancing:eu-west-2:664047078509:loadbalancer/app/lb-may26/3cf64897dfb55cc8"
+  port              = 80
+}
+
+data "aws_lb_target_group" "hosp" {
+  arn = "arn:aws:elasticloadbalancing:eu-west-2:664047078509:targetgroup/lb-tg-may26/d7eac9179951f0ca"
+}
+
+# --- create the Lambda target group ---
+
+resource "aws_lb_target_group" "lambda_proxy" {
+  name        = "may26-proxy-tg"
+  target_type = "lambda"
+}
+
+resource "aws_lambda_permission" "alb" {
+  statement_id  = "AllowALBInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.proxy_shield.function_name
+  principal     = "elasticloadbalancing.amazonaws.com"
+  source_arn    = aws_lb_target_group.lambda_proxy.arn
+}
+
+resource "aws_lb_target_group_attachment" "lambda_proxy" {
+  target_group_arn = aws_lb_target_group.lambda_proxy.arn
+  target_id        = aws_lambda_function.proxy_shield.arn
+  depends_on       = [aws_lambda_permission.alb]
+}
+
+# --- the canary rule ---
+
+variable "proxy_weight" {
+  type    = number
+  default = 5 # start at 0, raise gradually
+}
+
 resource "aws_lb_listener_rule" "canary_routing" {
   listener_arn = data.aws_lb_listener.existing_http.arn
-  priority     = 1
+  priority     = 1 # must be an unused priority - check existing rules first
 
   action {
     type = "forward"
+
     forward {
       target_group {
-        arn    = aws_lb_target_group.legacy_rails.arn
-        weight = 95
+        arn    = data.aws_lb_target_group.hosp.arn # existing HOSP TG, not a new "legacy_rails"
+        weight = 100 - var.proxy_weight
       }
+
       target_group {
         arn    = aws_lb_target_group.lambda_proxy.arn
-        weight = 5
+        weight = var.proxy_weight
+      }
+
+      stickiness {
+        enabled  = false
+        duration = 1
       }
     }
   }
 
   condition {
     path_pattern {
-      values = ["/patients*"]
+      values = ["/*"] # ALL paths. Use ["/patients*"] to limit the first canary's blast radius.
     }
   }
 }
-
-
 
 # ---- LAMBDA / ENV -----
 
