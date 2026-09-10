@@ -86,7 +86,7 @@ resource "aws_lambda_function" "proxy_shield" {
     role           =  aws_iam_role.lambda_exec.arn
     handler        = "index.lambda_handler"
     runtime        = "python3.12"
-    timeout        =  10
+    timeout        =  12
 
     environment {
         variables = {
