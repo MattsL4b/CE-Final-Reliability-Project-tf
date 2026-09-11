@@ -85,10 +85,11 @@ def lambda_handler(event, context):
     # -----------------------------------------------------------------------
 
     cache_key = None
+    resource_path = None
 
     if method == "GET":
 
-        cache_key = build_cache_key(
+        cache_key, resource_path = build_cache_key(
             authorization,
             path,
             query_params
@@ -133,6 +134,7 @@ def lambda_handler(event, context):
 
         save_to_cache(
             key=cache_key,
+            resource_path=resource_path,
             body=response_body,
             ttl_seconds=CACHE_TTL_SECONDS
         )
