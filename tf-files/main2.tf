@@ -220,7 +220,7 @@ resource "aws_lb_target_group_attachment" "lambda_proxy" {
 
 variable "proxy_weight" {
   type        = number
-  default     = 5 # Safe default: 0% traffic to Lambda proxy
+  default     = 50 # Safe default: 0% traffic to Lambda proxy
   description = "Percentage of traffic to send to the Lambda proxy (0-100)"
 }
 
@@ -284,7 +284,7 @@ resource "aws_lambda_function" "proxy_shield" {
     variables = {
       CACHE_TABLE_NAME    = aws_dynamodb_table.cache.name
       HOSP_BACKEND_URL    = "http://172.31.39.164"
-      CACHE_TTL_SECONDS   = "20" # Enforced as string
+      CACHE_TTL_SECONDS   = "60" # Enforced as string
       RETRY_WRITES_ON_5XX = "true"
     }
   }
