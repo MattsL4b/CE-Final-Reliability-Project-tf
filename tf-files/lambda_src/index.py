@@ -186,8 +186,9 @@ def build_cache_key(authorization, path, query_params):
 
     if query_string:
         resource = f"{normalized_path}?{query_string}"
+    cache_key = f"{caller_hash}:{resource}"
 
-    return f"{caller_hash}:{resource}"
+    return cache_key, normalized_path
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +241,7 @@ def get_from_cache(key):
 # CACHE WRITE
 # ---------------------------------------------------------------------------
 
-def save_to_cache(key, body, ttl_seconds):
+def save_to_cache(key, resource_path, body, ttl_seconds):
     """
     Saves a successful GET response in DynamoDB.
     """
@@ -252,6 +253,7 @@ def save_to_cache(key, body, ttl_seconds):
         cache_table.put_item(
             Item={
                 "cache_key": key,
+                "resource_path": resource_path,
                 "data": body,
                 "expires_at": expires_at
             }
@@ -303,49 +305,21 @@ def invalidate_related_cache(path):
     base_path = f"/{parts[0]}"
 
     try:
-
-        response = cache_table.scan(
+        response = cache_table.query(
+            IndexName="ResourceIndex",
+            KeyConditionExpression="resource_path = :path",
+            ExpressionAttributeValues={
+                ":path": base_path
+            },
+        
             ProjectionExpression="cache_key"
         )
-
-        while True:
-
-            for item in response.get("Items", []):
-
-                key = item.get("cache_key", "")
-
-                # Cache keys look like:
-                #
-                # <caller hash>:/notes
-                # <caller hash>:/notes?patient_id=3
-                # <caller hash>:/notes/12
-                if ":" not in key:
-                    continue
-
-                resource = key.split(":", 1)[-1]
-
-                if (
-                    resource == base_path
-                    or resource.startswith(base_path + "?")
-                    or resource.startswith(base_path + "/")
-                ):
-
-                    cache_table.delete_item(
-                        Key={
-                            "cache_key": key
-                        }
-                    )
-
-            last_key = response.get(
-                "LastEvaluatedKey"
-            )
-
-            if not last_key:
-                break
-
-            response = cache_table.scan(
-                ProjectionExpression="cache_key",
-                ExclusiveStartKey=last_key
+        items_to_delete = response.get("Items", [])
+        for item in items_to_delete:
+            cache_table.delete_item(
+                Key={
+                    "cache_key": item["cache_key"]
+                }
             )
 
         print(
