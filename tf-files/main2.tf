@@ -220,7 +220,7 @@ resource "aws_lb_target_group_attachment" "lambda_proxy" {
 
 variable "proxy_weight" {
   type        = number
-  default     = 0 # Safe default: 0% traffic to Lambda proxy
+  default     = 5 # Safe default: 0% traffic to Lambda proxy
   description = "Percentage of traffic to send to the Lambda proxy (0-100)"
 }
 
