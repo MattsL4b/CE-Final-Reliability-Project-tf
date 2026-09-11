@@ -18,7 +18,7 @@ HOSP_BASE_URL = os.environ["HOSP_BACKEND_URL"].rstrip("/")
 CACHE_TABLE_NAME = os.environ["CACHE_TABLE_NAME"]
 
 CACHE_TTL_SECONDS = int(
-    os.environ.get("CACHE_TTL_SECONDS", "30")
+    os.environ.get("CACHE_TTL_SECONDS", "60")
 )
 
 RETRY_WRITES_ON_5XX = (
@@ -99,7 +99,7 @@ def lambda_handler(event, context):
         if cached_body is not None:
 
             print(
-                f"CACHE HIT method={method} path={path}"
+                f"CACHE HIT method={method} path={path} key={cache_key} " 
             )
 
             return build_response(
@@ -109,7 +109,7 @@ def lambda_handler(event, context):
             )
 
         print(
-            f"CACHE MISS method={method} path={path}"
+            f"CACHE MISS method={method} path={path} key={cache_key}"
         )
 
     # -----------------------------------------------------------------------
@@ -171,6 +171,8 @@ def build_cache_key(authorization, path, query_params):
 
         7e63ab...:/notes?patient_id=3
     """
+    normalized_path = path.rstrip("/") or "/"
+
 
     caller_hash = hashlib.sha256(
         authorization.encode("utf-8")
@@ -180,10 +182,10 @@ def build_cache_key(authorization, path, query_params):
         sorted(query_params.items())
     )
 
-    resource = path
+    resource = normalized_path
 
     if query_string:
-        resource = f"{path}?{query_string}"
+        resource = f"{normalized_path}?{query_string}"
 
     return f"{caller_hash}:{resource}"
 
@@ -227,8 +229,8 @@ def get_from_cache(key):
 
         # Cache failure should not make the HOSP service unavailable.
         print(
-            "CACHE READ ERROR "
-            f"type={type(error).__name__}"
+            f"CACHE READ ERROR: {str(error)} "
+            
         )
 
         return None
@@ -254,14 +256,14 @@ def save_to_cache(key, body, ttl_seconds):
                 "expires_at": expires_at
             }
         )
+        print(f"CACHE STORED key={key} ttl={ttl_seconds}s")
 
     except Exception as error:
 
         # Caching is an optimisation. A failed cache write should not
         # turn a successful HOSP response into a failed user request.
         print(
-            "CACHE WRITE ERROR "
-            f"type={type(error).__name__}"
+            f"CACHE WRITE ERROR: {str(error)}"
         )
 
 
@@ -310,13 +312,15 @@ def invalidate_related_cache(path):
 
             for item in response.get("Items", []):
 
-                key = item["cache_key"]
+                key = item.get("cache_key", "")
 
                 # Cache keys look like:
                 #
                 # <caller hash>:/notes
                 # <caller hash>:/notes?patient_id=3
                 # <caller hash>:/notes/12
+                if ":" not in key:
+                    continue
 
                 resource = key.split(":", 1)[-1]
 
@@ -352,8 +356,7 @@ def invalidate_related_cache(path):
 
         # Again: failure of the cache should not fail the user's write.
         print(
-            "CACHE INVALIDATION ERROR "
-            f"type={type(error).__name__}"
+            f"CACHE INVALIDATION ERROR: {str(error)}"
         )
 
 
