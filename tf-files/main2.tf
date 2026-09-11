@@ -226,7 +226,7 @@ variable "proxy_weight" {
 
 resource "aws_lb_listener_rule" "canary_routing" {
   listener_arn = data.aws_lb_listener.existing_http.arn
-  priority     = 0 # Avoids priority 1 collision
+  priority     = 10 # Avoids priority 1 collision
 
   action {
     type = "forward"
