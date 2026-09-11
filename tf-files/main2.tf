@@ -133,9 +133,9 @@ resource "aws_security_group" "lambda_sg" {
 
   ingress {
     from_port = 80
-    to_port = 80
-    protocol = "tcp"
-    self = true
+    to_port   = 80
+    protocol  = "tcp"
+    self      = true
   }
 
   ingress {
@@ -226,7 +226,7 @@ variable "proxy_weight" {
 
 resource "aws_lb_listener_rule" "canary_routing" {
   listener_arn = data.aws_lb_listener.existing_http.arn
-  priority     = 10 # Avoids priority 1 collision
+  priority     = 0 # Avoids priority 1 collision
 
   action {
     type = "forward"
