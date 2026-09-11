@@ -93,7 +93,8 @@ resource "aws_iam_policy" "lambda_dynamodb_cache" {
           "dynamodb:GetItem",
           "dynamodb:PutItem",
           "dynamodb:DeleteItem",
-          "dynamodb:Scan"
+          "dynamodb:Scan",
+          "dynamodb:CreateTable"
         ]
         Resource = aws_dynamodb_table.cache.arn
       },
@@ -129,6 +130,13 @@ resource "aws_security_group" "lambda_sg" {
   name        = "may26-lambda-proxy-sg"
   description = "Security group for Lambda proxy shield"
   vpc_id      = "vpc-080dbb0b7dc86503a"
+
+  ingress {
+    from_port = 80
+    to_port = 80
+    protocol = "tcp"
+    self = true
+  }
 
   ingress {
     from_port = 443
