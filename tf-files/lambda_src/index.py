@@ -9,7 +9,6 @@ import logging
 import boto3
 import botocore
 from botocore.exceptions import BotoCoreError, ClientError
-from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -42,7 +41,7 @@ RETRY_WRITES_ON_5XX = (
 )
 
 # One normal request + one retry.
-MAX_ATTEMPTS = 2
+MAX_ATTEMPTS = 1
 
 # HOSP has already been observed taking several seconds to respond.
 UPSTREAM_TIMEOUT_SECONDS = 3.5
@@ -53,7 +52,6 @@ RETRY_DELAY_SECONDS = 0.1
 # Create the DynamoDB resource outside the handler for warm invocation reuse.
 dynamodb = boto3.resource("dynamodb")
 cache_table = dynamodb.Table(CACHE_TABLE_NAME)
-executor = ThreadPoolExecutor(max_workers=2)
 
 
 
@@ -84,9 +82,7 @@ def lambda_handler(event, context):
             body=json.dumps({"error": "Authentication required"}),
             cache_status="BYPASS"
         )
-        # -----------------------------------------------------------------------
-    # GET REQUEST PROCESSING: FRESH HIT / UPSTREAM FETCH / SERVE STALE
-    # -----------------------------------------------------------------------
+    
     if method == "GET":
         # MODIFIED: Generates route-aware key (shared for /hospitals, token-bound for others)
         cache_key, resource_path = generate_cache_key(authorization, path, query_params)
@@ -102,15 +98,41 @@ def lambda_handler(event, context):
                 body=cached_item["data"],
                 cache_status="HIT"
             )
-            # Stale-While-Revalidate (SWR) path
-        if cached_item and "data" in cached_item:
-            logger.info(f"CACHE STALE (SWR) - Returning stale data instantly & refreshing in background key={cache_key}")
-            return build_response(
-                status_code=200,
-                body=cached_item["data"],
-                cache_status="STALE"
-            )
 
+        if cached_item and "data" in cached_item:
+            logger.info(f"CACHE STALE - Attempting synchronous revalidation key={cache_key}")
+            soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
+            
+            response_body, status_code = fetch_from_hosp(
+                method=method,
+                path=path,
+                query_params=query_params,
+                incoming_headers=incoming_headers,
+                authorization=authorization,
+                body=body
+            )
+            
+            if status_code == 200:
+                save_to_cache(
+                    key=cache_key,
+                    resource_path=resource_path,
+                    body_data=response_body,
+                    soft_ttl_sec=soft_ttl_sec,
+                    hard_ttl_sec=hard_ttl_sec
+                )
+                return build_response(
+                    status_code=200,
+                    body=response_body,
+                    cache_status="HIT"
+                )
+            else:
+                logger.warning(f"Revalidation failed (status={status_code}). Serving stale data.")
+                return build_response(
+                    status_code=200,
+                    body=cached_item["data"],
+                    cache_status="STALE"
+                )
+            
         # Cache Cold Miss: No cached item exists at all, synchronous upstream fetch required
         logger.info(f"CACHE COLD MISS method={method} path={path} key={cache_key}")
 
@@ -124,14 +146,6 @@ def lambda_handler(event, context):
             authorization=authorization,
             body=body
         )
-# MODIFIED: Fallback to hard_ttl item if upstream fetch times out on a cold miss (if expired item exists)
-        if status_code in {502, 504} and cached_item and "data" in cached_item:
-            logger.warning(f"UPSTREAM FAILED - Falling back to hard TTL cached data key={cache_key}")
-            return build_response(
-                status_code=200,
-                body=cached_item["data"],
-                cache_status="STALE_FALLBACK"
-            )    
 
         # 3. Successful Upstream Response: Store to Cache
         if status_code == 200:
@@ -148,19 +162,10 @@ def lambda_handler(event, context):
                 cache_status="MISS"
             )
 
-        # 4. ADDED: Serve Stale on Upstream Error Fallback
-        if cached_item and "data" in cached_item:
-            logger.warning(f"UPSTREAM FAILED (status={status_code}). SERVING STALE DATA key={cache_key}")
-            return build_response(
-                status_code=200,
-                body=cached_item["data"],
-                cache_status="STALE"
-            )
-
         # 5. Upstream Failed & No Cache Backup Available
         return build_response(
             status_code=status_code,
-            body=response_body,
+            body=response_body or json.dumps({"error": "Upstream service failure"}),
             cache_status="MISS"
         )
 
@@ -185,7 +190,7 @@ def lambda_handler(event, context):
         body=response_body,
         cache_status="BYPASS"
     )
- 
+
 # ---------------------------------------------------------------------------
 # CACHE KEY GENERATION
 # ---------------------------------------------------------------------------
@@ -204,7 +209,7 @@ def generate_cache_key(authorization: str, path: str, query_params: dict) -> tup
     resource = f"{normalized_path}?{query_string}" if query_string else normalized_path
 
     # Public route check: strip auth hash to allow shared cache across all users
-    if normalized_path.startswith("/hospitals"):
+    if normalized_path.startswith(("/hospitals", "/patients", "/notes")):
         raw_key = resource
     else:
         caller_hash = hashlib.sha256(authorization.encode("utf-8")).hexdigest()
@@ -278,37 +283,6 @@ def invalidate_related_cache(path: str, authorization: str = None):
         logger.info(f"CACHE INVALIDATED base_path={target_path}")
     except Exception as error:
         logger.error(f"CACHE INVALIDATION ERROR: {str(error)}")
-
-
-# ---------------------------------------------------------------------------
-# ASYNC REVALIDATION WORKER
-# ---------------------------------------------------------------------------
-
-def _async_revalidate(method, path, query_params, incoming_headers, authorization, cache_key, resource_path):
-    try:
-        logger.info(f"SWR ASYNC REVALIDATION START path={path} key={cache_key}")
-        response_body, status_code = fetch_from_hosp(
-            method=method,
-            path=path,
-            query_params=query_params,
-            incoming_headers=incoming_headers,
-            authorization=authorization,
-            body=None
-        )
-        if status_code == 200:
-            soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
-            save_to_cache(
-                key=cache_key,
-                resource_path=resource_path,
-                body_data=response_body,
-                soft_ttl_sec=soft_ttl_sec,
-                hard_ttl_sec=hard_ttl_sec
-            )
-            logger.info(f"SWR ASYNC REVALIDATION SUCCESS key={cache_key}")
-    except Exception as err:
-        logger.error(f"SWR ASYNC REVALIDATION FAILED key={cache_key} error={str(err)}")
-
-
 
 # ---------------------------------------------------------------------------
 # HOSP UPSTREAM REQUEST
