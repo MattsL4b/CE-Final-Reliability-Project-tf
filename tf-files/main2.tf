@@ -48,6 +48,16 @@ resource "aws_dynamodb_table" "cache" {
     name = "cache_key"
     type = "S"
   }
+  attribute {
+    name = "resource_path"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name = "ResourceIndex"
+    hash_key = "resource_path"
+    projection_type = "KEYS_ONLY"
+  }
 
   ttl {
     attribute_name = "expires_at"
@@ -94,9 +104,13 @@ resource "aws_iam_policy" "lambda_dynamodb_cache" {
           "dynamodb:PutItem",
           "dynamodb:DeleteItem",
           "dynamodb:Scan",
-          "dynamodb:CreateTable"
+          "dynamodb:CreateTable",
+          "dynamodb:Query"
         ]
-        Resource = aws_dynamodb_table.cache.arn
+        Resource = [
+          aws_dynamodb_table.cache.arn,
+          "${aws_dynamodb_table.cache.arn}/index/*"
+        ] 
       },
       {
         Effect = "Allow"
@@ -220,7 +234,7 @@ resource "aws_lb_target_group_attachment" "lambda_proxy" {
 
 variable "proxy_weight" {
   type        = number
-  default     = 50 # Safe default: 0% traffic to Lambda proxy
+  default     = 100 # Safe default: 0% traffic to Lambda proxy
   description = "Percentage of traffic to send to the Lambda proxy (0-100)"
 }
 
@@ -270,7 +284,7 @@ resource "aws_lambda_function" "proxy_shield" {
   timeout          = 25 # Accommodates slow HOSP calls + retries
 
   # Protect Puma from thread exhaustion by capping concurrency
-  reserved_concurrent_executions = 5
+  reserved_concurrent_executions = 10
 
   vpc_config {
     subnet_ids = [
@@ -284,7 +298,7 @@ resource "aws_lambda_function" "proxy_shield" {
     variables = {
       CACHE_TABLE_NAME    = aws_dynamodb_table.cache.name
       HOSP_BACKEND_URL    = "http://172.31.39.164"
-      CACHE_TTL_SECONDS   = "60" # Enforced as string
+      CACHE_TTL_SECONDS   = "300" # Enforced as string
       RETRY_WRITES_ON_5XX = "true"
     }
   }

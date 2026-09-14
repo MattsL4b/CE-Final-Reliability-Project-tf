@@ -5,17 +5,37 @@ import hashlib
 import urllib.request
 import urllib.error
 import urllib.parse
-
+import logging
 import boto3
+import botocore
+from botocore.exceptions import BotoCoreError, ClientError
 
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
+def get_ttl_config(path:str):
+    if path.startswith("/hospitals"):
+        return 900, 86400 # 15 mins fresh, 24 hours retention
+    if path.startswith("/patients"):
+        return 300, 43200
+    return 60, 7200
+
+def generate_cache_key(auth_token: str, path: str, query_string: str):
+    if path in ["/hospitals"]:
+        raw_key = f"{path}?{query_string}"
+    else:
+        raw_key = f"{auth_token}:{path}?{query_string}"
+    return hashlib.sha256(raw_key.encode('utf-8')).hexdige
+
+    
 HOSP_BASE_URL = os.environ["HOSP_BACKEND_URL"].rstrip("/")
 #changed name below from chache_table_name
 CACHE_TABLE_NAME = os.environ["CACHE_TABLE_NAME"]
+
 
 CACHE_TTL_SECONDS = int(
     os.environ.get("CACHE_TTL_SECONDS", "60")
@@ -39,6 +59,7 @@ RETRY_DELAY_SECONDS = 0.2
 # Lambda can reuse this object across warm invocations.
 dynamodb = boto3.resource("dynamodb")
 cache_table = dynamodb.Table(CACHE_TABLE_NAME)
+table = dynamodb.Table(CACHE_TABLE_NAME)
 
 
 # ---------------------------------------------------------------------------
@@ -636,3 +657,71 @@ def build_response(
         },
         "body": body
     }
+
+# ------------------------------------------------------------------
+# HANDLER HELPERS
+# ------------------------------------------------------------------
+
+def get_cached_item(cache_key: str):
+    try:
+        response = table.get_item(Key={'cache_key': cache_key})
+        return response.get('Item')
+    except (BotoCoreError, ClientError) as e:
+        logger.error(f"DynamoDB read error: {str(e)}")
+    return None
+
+def save_to_cache(cache_key: str, payload: dict, soft_ttl_sec: int, hard_ttl_sec: int):
+    now = int(time.time())
+    try:
+        table.put_item(
+            Item={
+                'cache_key': cache_key,
+                'payload': json.dumps(payload),
+                'soft_ttl': now + soft_ttl_sec,
+                'ttl': now + hard_ttl_sec # Used by DynamoDB TTL feature
+            }
+        )
+    except (BotoCoreError, ClientError) as e:
+        logger.error(f"DynamoDB write error: {str(e)}")
+
+
+# ------------------------------------------------------------------
+# REQUEST PROCESSING LOGIC
+# ------------------------------------------------------------------
+
+def handle_get_request(auth_token: str, path: str, query_string: str):
+    cache_key = generate_cache_key(auth_token, path, query_string)
+    now = int(time.time())
+
+    cached_item = get_cached_item(cache_key)
+
+    # 1. Fresh Cache Hit
+    if cached_item and now < cached_item.get('soft_ttl', 0):
+        logger.info(f"CACHE HIT path={path} key={cache_key}")
+        return build_response(200, json.loads(cached_item['payload']))
+
+    logger.info(f"CACHE MISS/EXPIRED path={path} key={cache_key}")
+
+    # 2. Attempt Upstream Fetch
+    soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
+    try:
+        upstream_res = fetch_from_hosp(path, query_string, auth_token)
+
+        if upstream_res.status_code == 200:
+            payload = upstream_res.json()
+            save_to_cache(cache_key, payload, soft_ttl_sec, hard_ttl_sec)
+            return build_response(200, payload)
+        else:
+            raise Exception(f"Upstream returned status {upstream_res.status_code}")
+
+    except Exception as err:
+        logger.warning(f"Upstream request failed: {str(err)}")
+
+        # 3. Serve Stale on Upstream Error Fallback
+        if cached_item and 'payload' in cached_item:
+            logger.info(f"SERVING STALE DATA path={path} key={cache_key}")
+            return build_response(200, json.loads(cached_item['payload']))
+
+        # 4. Final Failure if no cached data exists at all
+        logger.error(f"NO CACHE FALLBACK AVAILABLE path={path}")
+        return build_response(502, {"error": "Upstream service unavailable"})
