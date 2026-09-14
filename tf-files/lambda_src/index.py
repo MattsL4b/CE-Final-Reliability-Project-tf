@@ -85,10 +85,8 @@ def lambda_handler(event, context):
         )
     
     if method == "GET":
-        # MODIFIED: Generates route-aware key (shared for /hospitals, token-bound for others)
         cache_key, resource_path = generate_cache_key(authorization, path, query_params)
         now = int(time.time())
-        
         cached_item = get_from_cache(cache_key)
 
         # 1. Fresh Cache Hit 
@@ -100,75 +98,52 @@ def lambda_handler(event, context):
                 cache_status="HIT"
             )
 
+        # 2. Stale Cache Hit - Try upstream; fallback instantly to stale data if upstream fails
         if cached_item and "data" in cached_item:
-            logger.info(f"CACHE STALE - Attempting synchronous revalidation key={cache_key}")
+            logger.info(f"CACHE STALE - Fetching revalidation key={cache_key}")
             soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
-            
-            response_body, status_code = fetch_from_hosp(
-                method=method,
-                path=path,
-                query_params=query_params,
-                incoming_headers=incoming_headers,
-                authorization=authorization,
-                body=body
+
+            upstream_body, upstream_status = fetch_from_hosp(
+                method=method, path=path, query_params=query_params,
+                incoming_headers=incoming_headers, authorization=authorization, body=body
             )
-            
-            if status_code == 200:
-                save_to_cache(
-                    key=cache_key,
-                    resource_path=resource_path,
-                    body_data=response_body,
-                    soft_ttl_sec=soft_ttl_sec,
-                    hard_ttl_sec=hard_ttl_sec
-                )
+            if upstream_status == 200:
+                save_to_cache(cache_key, resource_path, upstream_body, soft_ttl_sec, hard_ttl_sec)
                 return build_response(
-                    status_code=200,
-                    body=response_body,
+                    status_code =200,
+                    body=upstream_body,
                     cache_status="HIT"
                 )
-            else:
-                logger.warning(f"Revalidation failed (status={status_code}). Serving stale data.")
-                return build_response(
-                    status_code=200,
-                    body=cached_item["data"],
-                    cache_status="STALE"
-                )
             
-        # Cache Cold Miss: No cached item exists at all, synchronous upstream fetch required
-        logger.info(f"CACHE COLD MISS method={method} path={path} key={cache_key}")
-
-        soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
-        
-        response_body, status_code = fetch_from_hosp(
-            method=method,
-            path=path,
-            query_params=query_params,
-            incoming_headers=incoming_headers,
-            authorization=authorization,
-            body=body
-        )
-
-        # 3. Successful Upstream Response: Store to Cache
-        if status_code == 200:
-            save_to_cache(
-                key=cache_key,
-                resource_path=resource_path,
-                body_data=response_body,
-                soft_ttl_sec=soft_ttl_sec,
-                hard_ttl_sec=hard_ttl_sec
-            )
+            logger.warning(f"Revalidation failed (status={upstream_status}). Serving stale cache")
             return build_response(
                 status_code=200,
-                body=response_body,
+                body=cached_item["data"],
+                cache_status="STALE"
+            )
+
+        # 3. Cache Cold Miss - Fetch upstream and write to cache
+        logger.info(f"CACHE COLD MISS method={method} path={path} key={cache_key}")
+        soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
+
+        upstream_body, upstream_status = fetch_from_hosp(
+            method=method, path=path, query_params=query_params,
+            incoming_headers=incoming_headers, authorization=authorization, body=body
+        )
+
+        if upstream_status == 200:
+            save_to_cache(cache_key, resource_path, upstream_body, soft_ttl_sec, hard_ttl_sec)
+            return build_response(
+                status_code=200,
+                body=upstream_body,
                 cache_status="MISS"
             )
 
-        # 5. Upstream Failed & No Cache Backup Available
         return build_response(
-            status_code=status_code,
-            body=response_body or json.dumps({"error": "Upstream service failure"}),
+            status_code=upstream_status,
+            body=upstream_body or json.dumps({"error": "Upstream service failure"}),
             cache_status="MISS"
-        )
+        )           
 
     # -----------------------------------------------------------------------
     # NON-GET MUTATIONS (POST, PUT, PATCH, DELETE)
@@ -219,14 +194,11 @@ def generate_cache_key(authorization: str, path: str, query_params: dict) -> tup
     cache_key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
     return cache_key, normalized_path
 
-def build_cache_key(authorization: str, path: str, query_params: dict) -> tuple[str, str]:
-    return generate_cache_key(authorization, path, query_params)
 
 # ---------------------------------------------------------------------------
 # CACHE OPERATIONS (READ / WRITE / INVALIDATE)
 # ---------------------------------------------------------------------------
 
-# MODIFIED: Updated to retrieve full item for Soft TTL + Hard TTL inspection
 def get_from_cache(key: str):
     """
     Retrieves cached item from DynamoDB if present.
@@ -240,7 +212,6 @@ def get_from_cache(key: str):
         return None
 
 
-# MODIFIED: Updated to accept soft_ttl and hard_ttl parameters and store JSON payloads
 def save_to_cache(key: str, resource_path: str, body_data: str, soft_ttl_sec: int, hard_ttl_sec: int):
     """
     Saves payload with both soft_ttl (freshness) and hard_ttl (DynamoDB auto-cleanup).
@@ -253,7 +224,7 @@ def save_to_cache(key: str, resource_path: str, body_data: str, soft_ttl_sec: in
                 "resource_path": resource_path,
                 "data": body_data,
                 "soft_ttl": now + soft_ttl_sec,
-                "ttl": now + hard_ttl_sec  # DynamoDB native TTL attribute name
+                "expires_at": now + hard_ttl_sec  # DynamoDB native TTL attribute name (ttl key in main.tf)
             }
         )
         logger.info(f"CACHE STORED key={key} soft_ttl={soft_ttl_sec}s hard_ttl={hard_ttl_sec}s")
@@ -346,31 +317,23 @@ def fetch_from_hosp(
             if method == "GET" and transient_error and attempts_remaining:
                 time.sleep(RETRY_DELAY_SECONDS)
                 continue
-
-            if (
-                method in {"POST", "PUT", "PATCH", "DELETE"}
-                and RETRY_WRITES_ON_5XX
-                and transient_error
-                and attempts_remaining
-            ):
-                time.sleep(RETRY_DELAY_SECONDS)
-                continue
-
             return error_body, status_code
 
-        except urllib.error.URLError:
-            logger.error(f"HOSP CONNECTION ERROR method={method} path={path} attempt={attempt}")
-            if method == "GET" and attempt < MAX_ATTEMPTS:
+        except urllib.error.URLError as error:
+            status_code = 502
+            logger.error(f"HOSP CONNECTION ERROR method={method} path={path} attempt={attempt} err={error}")
+            if method == "GET" and attempts_remaining:
                 time.sleep(RETRY_DELAY_SECONDS)
                 continue
-            return json.dumps({"error": "Unable to contact HOSP"}), 502
+            return json.dumps({"error": "Unable to contact HOSP"}), status_code
 
         except TimeoutError:
+            status_code = 504
             logger.error(f"HOSP TIMEOUT method={method} path={path} attempt={attempt}")
-            if method == "GET" or (method in {"POST", "PUT", "PATCH"} and RETRY_WRITES_ON_5XX) and attempts_remaining:
+            if method == "GET" and attempts_remaining:
                 time.sleep(RETRY_DELAY_SECONDS)
                 continue
-            return json.dumps({"error": "HOSP timed out"}), 504
+            return json.dumps({"error": "HOSP timed out"}), status_code
 
     return json.dumps({"error": "Unexpected proxy failure"}), 502
 

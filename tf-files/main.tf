@@ -284,7 +284,7 @@ resource "aws_lambda_function" "proxy_shield" {
   timeout          = 25 # Accommodates slow HOSP calls + retries
 
   # Protect Puma from thread exhaustion by capping concurrency
-  reserved_concurrent_executions = 10
+  reserved_concurrent_executions = 50
 
   vpc_config {
     subnet_ids = [
