@@ -105,10 +105,6 @@ def lambda_handler(event, context):
             # Stale-While-Revalidate (SWR) path
         if cached_item and "data" in cached_item:
             logger.info(f"CACHE STALE (SWR) - Returning stale data instantly & refreshing in background key={cache_key}")
-            executor.submit(
-                _async_revalidate,
-                method, path, query_params, incoming_headers, authorization, cache_key, resource_path
-            )
             return build_response(
                 status_code=200,
                 body=cached_item["data"],
