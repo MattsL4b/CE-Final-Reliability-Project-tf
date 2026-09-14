@@ -58,6 +58,117 @@ cache_table = dynamodb.Table(CACHE_TABLE_NAME)
 
 
 # ---------------------------------------------------------------------------
+# MAIN LAMBDA HANDLER
+# ---------------------------------------------------------------------------
+
+def lambda_handler(event, context):
+    """
+    Main Lambda entry point.
+    Handles route-aware caching, serve-stale-on-error, and mutation invalidation.
+    """
+    method = event.get("httpMethod", "GET").upper()
+    path = event.get("path", "/")
+    query_params = event.get("queryStringParameters") or {}
+    incoming_headers = event.get("headers") or {}
+    body = event.get("body")
+
+    authorization = (
+        incoming_headers.get("authorization") or incoming_headers.get("Authorization")
+    )
+
+    if not authorization:
+        return build_response(
+            status_code=401,
+            body=json.dumps({"error": "Authentication required"}),
+            cache_status="BYPASS"
+        )
+        # -----------------------------------------------------------------------
+    # GET REQUEST PROCESSING: FRESH HIT / UPSTREAM FETCH / SERVE STALE
+    # -----------------------------------------------------------------------
+    if method == "GET":
+        # MODIFIED: Generates route-aware key (shared for /hospitals, token-bound for others)
+        cache_key, resource_path = generate_cache_key(authorization, path, query_params)
+        now = int(time.time())
+        
+        cached_item = get_from_cache(cache_key)
+
+        # 1. Fresh Cache Hit (now < soft_ttl)
+        if cached_item and now < int(cached_item.get("soft_ttl", 0)):
+            logger.info(f"CACHE HIT method={method} path={path} key={cache_key}")
+            return build_response(
+                status_code=200,
+                body=cached_item["data"],
+                cache_status="HIT"
+            )
+
+        logger.info(f"CACHE MISS/EXPIRED method={method} path={path} key={cache_key}")
+
+        # 2. Upstream Fetch
+        soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
+        
+        response_body, status_code = fetch_from_hosp(
+            method=method,
+            path=path,
+            query_params=query_params,
+            incoming_headers=incoming_headers,
+            authorization=authorization,
+            body=body
+        )
+
+        # 3. Successful Upstream Response: Store to Cache
+        if status_code == 200:
+            save_to_cache(
+                key=cache_key,
+                resource_path=resource_path,
+                body_data=response_body,
+                soft_ttl_sec=soft_ttl_sec,
+                hard_ttl_sec=hard_ttl_sec
+            )
+            return build_response(
+                status_code=200,
+                body=response_body,
+                cache_status="MISS"
+            )
+
+        # 4. ADDED: Serve Stale on Upstream Error Fallback
+        if cached_item and "data" in cached_item:
+            logger.warning(f"UPSTREAM FAILED (status={status_code}). SERVING STALE DATA key={cache_key}")
+            return build_response(
+                status_code=200,
+                body=cached_item["data"],
+                cache_status="STALE"
+            )
+
+        # 5. Upstream Failed & No Cache Backup Available
+        return build_response(
+            status_code=status_code,
+            body=response_body,
+            cache_status="MISS"
+        )
+
+    # -----------------------------------------------------------------------
+    # NON-GET MUTATIONS (POST, PUT, PATCH, DELETE)
+    # -----------------------------------------------------------------------
+    response_body, status_code = fetch_from_hosp(
+        method=method,
+        path=path,
+        query_params=query_params,
+        incoming_headers=incoming_headers,
+        authorization=authorization,
+        body=body
+    )
+
+    # Invalidate cache if write succeeded
+    if status_code in {200, 201, 204}:
+        invalidate_related_cache(path)
+
+    return build_response(
+        status_code=status_code,
+        body=response_body,
+        cache_status="BYPASS"
+    )
+ 
+# ---------------------------------------------------------------------------
 # CACHE KEY GENERATION
 # ---------------------------------------------------------------------------
 
@@ -148,6 +259,9 @@ def invalidate_related_cache(path: str):
         logger.info(f"CACHE INVALIDATED base_path={base_path}")
     except Exception as error:
         logger.error(f"CACHE INVALIDATION ERROR: {str(error)}")
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -256,116 +370,3 @@ def build_response(status_code, body, cache_status):
         },
         "body": body
     }
-
-
-# ---------------------------------------------------------------------------
-# MAIN LAMBDA HANDLER
-# ---------------------------------------------------------------------------
-
-def lambda_handler(event, context):
-    """
-    Main Lambda entry point.
-    Handles route-aware caching, serve-stale-on-error, and mutation invalidation.
-    """
-    method = event.get("httpMethod", "GET").upper()
-    path = event.get("path", "/")
-    query_params = event.get("queryStringParameters") or {}
-    incoming_headers = event.get("headers") or {}
-    body = event.get("body")
-
-    authorization = (
-        incoming_headers.get("authorization") or incoming_headers.get("Authorization")
-    )
-
-    if not authorization:
-        return build_response(
-            status_code=401,
-            body=json.dumps({"error": "Authentication required"}),
-            cache_status="BYPASS"
-        )
-
-    # -----------------------------------------------------------------------
-    # GET REQUEST PROCESSING: FRESH HIT / UPSTREAM FETCH / SERVE STALE
-    # -----------------------------------------------------------------------
-    if method == "GET":
-        # MODIFIED: Generates route-aware key (shared for /hospitals, token-bound for others)
-        cache_key, resource_path = generate_cache_key(authorization, path, query_params)
-        now = int(time.time())
-        
-        cached_item = get_from_cache(cache_key)
-
-        # 1. Fresh Cache Hit (now < soft_ttl)
-        if cached_item and now < int(cached_item.get("soft_ttl", 0)):
-            logger.info(f"CACHE HIT method={method} path={path} key={cache_key}")
-            return build_response(
-                status_code=200,
-                body=cached_item["data"],
-                cache_status="HIT"
-            )
-
-        logger.info(f"CACHE MISS/EXPIRED method={method} path={path} key={cache_key}")
-
-        # 2. Upstream Fetch
-        soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
-        
-        response_body, status_code = fetch_from_hosp(
-            method=method,
-            path=path,
-            query_params=query_params,
-            incoming_headers=incoming_headers,
-            authorization=authorization,
-            body=body
-        )
-
-        # 3. Successful Upstream Response: Store to Cache
-        if status_code == 200:
-            save_to_cache(
-                key=cache_key,
-                resource_path=resource_path,
-                body_data=response_body,
-                soft_ttl_sec=soft_ttl_sec,
-                hard_ttl_sec=hard_ttl_sec
-            )
-            return build_response(
-                status_code=200,
-                body=response_body,
-                cache_status="MISS"
-            )
-
-        # 4. ADDED: Serve Stale on Upstream Error Fallback
-        if cached_item and "data" in cached_item:
-            logger.warning(f"UPSTREAM FAILED (status={status_code}). SERVING STALE DATA key={cache_key}")
-            return build_response(
-                status_code=200,
-                body=cached_item["data"],
-                cache_status="STALE"
-            )
-
-        # 5. Upstream Failed & No Cache Backup Available
-        return build_response(
-            status_code=status_code,
-            body=response_body,
-            cache_status="MISS"
-        )
-
-    # -----------------------------------------------------------------------
-    # NON-GET MUTATIONS (POST, PUT, PATCH, DELETE)
-    # -----------------------------------------------------------------------
-    response_body, status_code = fetch_from_hosp(
-        method=method,
-        path=path,
-        query_params=query_params,
-        incoming_headers=incoming_headers,
-        authorization=authorization,
-        body=body
-    )
-
-    # Invalidate cache if write succeeded
-    if status_code in {200, 201, 204}:
-        invalidate_related_cache(path)
-
-    return build_response(
-        status_code=status_code,
-        body=response_body,
-        cache_status="BYPASS"
-    )
