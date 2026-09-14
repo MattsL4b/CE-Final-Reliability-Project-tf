@@ -28,6 +28,8 @@ def get_ttl_config(path: str) -> tuple[int, int]:
         return 900, 86400    # 15 mins fresh, 24 hours retention
     if path.startswith("/patients"):
         return 300, 43200    # 5 mins fresh, 12 hours retention
+    if path.startswith("/notes"):
+        return 300, 43200    # 5 mins fresh, 12 hours retention
     return 60, 7200          # 1 min fresh, 2 hours retention (default /notes)
 
 
@@ -107,10 +109,11 @@ def lambda_handler(event, context):
                 method=method, path=path, query_params=query_params,
                 incoming_headers=incoming_headers, authorization=authorization, body=body
             )
+            
             if upstream_status == 200:
                 save_to_cache(cache_key, resource_path, upstream_body, soft_ttl_sec, hard_ttl_sec)
                 return build_response(
-                    status_code =200,
+                    status_code=200,
                     body=upstream_body,
                     cache_status="HIT"
                 )
@@ -179,9 +182,13 @@ def generate_cache_key(authorization: str, path: str, query_params: dict) -> tup
     so all users share a single cache entry.
     """
     normalized_path = path.rstrip("/") or "/"
-    
+
+    # strip transient and volatile dynamic parameters before hashing
+    ignored_params = {"_", "timestamp", "cb", "cachebust", "request_id", "nonce"}
+    filtered_params = {k: v for k, v in query_params.items() if k.lower() not in ignored_params}
+
     # Sort query string for deterministic keys
-    query_string = urllib.parse.urlencode(sorted(query_params.items())) if query_params else ""
+    query_string = urllib.parse.urlencode(sorted(filtered_params.items())) if filtered_params else ""
     resource = f"{normalized_path}?{query_string}" if query_string else normalized_path
 
     # Public route check: strip auth hash to allow shared cache across all users
@@ -287,7 +294,6 @@ def fetch_from_hosp(
         outgoing_headers["Content-Type"] = content_type
 
     request_body = body.encode("utf-8") if body is not None else None
-
     timeout = GET_TIMEOUT_SECONDS if method == "GET" else WRITE_TIMEOUT_SECONDS
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
