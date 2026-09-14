@@ -44,7 +44,8 @@ RETRY_WRITES_ON_5XX = (
 MAX_ATTEMPTS = 1
 
 # HOSP has already been observed taking several seconds to respond.
-UPSTREAM_TIMEOUT_SECONDS = 3.5
+GET_TIMEOUT_SECONDS = 3.5
+WRITE_TIMEOUT_SECONDS = 5.0
 
 # Small delay before retrying.
 RETRY_DELAY_SECONDS = 0.1
@@ -90,7 +91,7 @@ def lambda_handler(event, context):
         
         cached_item = get_from_cache(cache_key)
 
-        # 1. Fresh Cache Hit (now < soft_ttl)
+        # 1. Fresh Cache Hit 
         if cached_item and now < int(cached_item.get("soft_ttl", 0)):
             logger.info(f"CACHE HIT method={method} path={path} key={cache_key}")
             return build_response(
@@ -316,6 +317,8 @@ def fetch_from_hosp(
 
     request_body = body.encode("utf-8") if body is not None else None
 
+    timeout = GET_TIMEOUT_SECONDS if method == "GET" else WRITE_TIMEOUT_SECONDS
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         attempts_remaining = attempt < MAX_ATTEMPTS
         request = urllib.request.Request(
@@ -327,7 +330,7 @@ def fetch_from_hosp(
 
         try:
             logger.info(f"HOSP REQUEST method={method} path={path} attempt={attempt}")
-            with urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT_SECONDS) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 response_body = response.read().decode("utf-8")
                 logger.info(f"HOSP RESPONSE method={method} path={path} status={response.status} attempt={attempt}")
                 return response_body, response.status
