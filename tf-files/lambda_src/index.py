@@ -186,7 +186,7 @@ def generate_cache_key(authorization: str, path: str, query_params: dict) -> tup
     resource = f"{normalized_path}?{query_string}" if query_string else normalized_path
 
     # Public route check: strip auth hash to allow shared cache across all users
-    if normalized_path in ["/hospitals"]:
+    if normalized_path.startswith("/hospitals"):
         raw_key = resource
     else:
         caller_hash = hashlib.sha256(authorization.encode("utf-8")).hexdigest()
@@ -195,6 +195,8 @@ def generate_cache_key(authorization: str, path: str, query_params: dict) -> tup
     cache_key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
     return cache_key, normalized_path
 
+def build_cache_key(authorization: str, path: str, query_params: dict) -> tuple[str, str]:
+    return generate_cache_key(authorization, path, query_params)
 
 # ---------------------------------------------------------------------------
 # CACHE OPERATIONS (READ / WRITE / INVALIDATE)
