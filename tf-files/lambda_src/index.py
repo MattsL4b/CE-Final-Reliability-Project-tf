@@ -317,6 +317,7 @@ def fetch_from_hosp(
     request_body = body.encode("utf-8") if body is not None else None
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        attempts_remaining = attempt < MAX_ATTEMPTS
         request = urllib.request.Request(
             url=url,
             data=request_body,
@@ -337,7 +338,7 @@ def fetch_from_hosp(
             logger.warning(f"HOSP HTTP ERROR method={method} path={path} status={status_code} attempt={attempt}")
 
             transient_error = status_code in {500, 503}
-            attempts_remaining = attempt < MAX_ATTEMPTS
+
 
             if method == "GET" and transient_error and attempts_remaining:
                 time.sleep(RETRY_DELAY_SECONDS)
