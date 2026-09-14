@@ -46,7 +46,7 @@ RETRY_WRITES_ON_5XX = (
 MAX_ATTEMPTS = 1
 
 # HOSP has already been observed taking several seconds to respond.
-GET_TIMEOUT_SECONDS = 3.5
+GET_TIMEOUT_SECONDS = 8
 WRITE_TIMEOUT_SECONDS = 5.0
 
 # Small delay before retrying.
@@ -85,6 +85,8 @@ def lambda_handler(event, context):
             body=json.dumps({"error": "Authentication required"}),
             cache_status="BYPASS"
         )
+
+    logger.info(f"INCOMING REQUEST path={path} query_params={query_params}")
     
     if method == "GET":
         cache_key, resource_path = generate_cache_key(authorization, path, query_params)
