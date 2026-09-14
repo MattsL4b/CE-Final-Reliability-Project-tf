@@ -14,32 +14,27 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
-# CONFIGURATION
+# CONFIGURATION & ROUTE TTL RULES
 # ---------------------------------------------------------------------------
 
-def get_ttl_config(path:str):
+# ADDED: Tiered TTL lookup based on endpoint path volatility
+def get_ttl_config(path: str) -> tuple[int, int]:
+    """
+    Returns (soft_ttl_seconds, hard_ttl_seconds) based on endpoint stability.
+    - soft_ttl: Window where cached data is considered completely fresh.
+    - hard_ttl: Time-To-Live for DynamoDB automatic deletion.
+    """
     if path.startswith("/hospitals"):
-        return 900, 86400 # 15 mins fresh, 24 hours retention
+        return 900, 86400    # 15 mins fresh, 24 hours retention
     if path.startswith("/patients"):
-        return 300, 43200
-    return 60, 7200
+        return 300, 43200    # 5 mins fresh, 12 hours retention
+    return 60, 7200          # 1 min fresh, 2 hours retention (default /notes)
 
-def generate_cache_key(auth_token: str, path: str, query_string: str):
-    if path in ["/hospitals"]:
-        raw_key = f"{path}?{query_string}"
-    else:
-        raw_key = f"{auth_token}:{path}?{query_string}"
-    return hashlib.sha256(raw_key.encode('utf-8')).hexdige
 
-    
 HOSP_BASE_URL = os.environ["HOSP_BACKEND_URL"].rstrip("/")
-#changed name below from chache_table_name
 CACHE_TABLE_NAME = os.environ["CACHE_TABLE_NAME"]
 
-
-CACHE_TTL_SECONDS = int(
-    os.environ.get("CACHE_TTL_SECONDS", "60")
-)
+# MODIFIED: Removed fallback CACHE_TTL_SECONDS as we now use get_ttl_config()
 
 RETRY_WRITES_ON_5XX = (
     os.environ.get("RETRY_WRITES_ON_5XX", "false").lower() == "true"
@@ -54,274 +49,86 @@ UPSTREAM_TIMEOUT_SECONDS = 12
 # Small delay before retrying.
 RETRY_DELAY_SECONDS = 0.2
 
-
-# Create the DynamoDB resource outside the handler.
-# Lambda can reuse this object across warm invocations.
+# Create the DynamoDB resource outside the handler for warm invocation reuse.
 dynamodb = boto3.resource("dynamodb")
 cache_table = dynamodb.Table(CACHE_TABLE_NAME)
-table = dynamodb.Table(CACHE_TABLE_NAME)
+
+
+
 
 
 # ---------------------------------------------------------------------------
-# LAMBDA HANDLER
+# CACHE KEY GENERATION
 # ---------------------------------------------------------------------------
 
-def lambda_handler(event, context):
+# MODIFIED: Replaced build_cache_key with route-aware generate_cache_key
+def generate_cache_key(authorization: str, path: str, query_params: dict) -> tuple[str, str]:
     """
-    Entry point called by AWS Lambda.
-
-    Takes the ALB request event, checks the cache for GET requests,
-    forwards requests to HOSP where necessary, and returns an
-    ALB-compatible response.
-    """
-
-    method = event.get("httpMethod", "GET").upper()
-    path = event.get("path", "/")
-    query_params = event.get("queryStringParameters") or {}
-    incoming_headers = event.get("headers") or {}
-    body = event.get("body")
-
-    # -----------------------------------------------------------------------
-    # AUTHENTICATION
-    # -----------------------------------------------------------------------
-
-    # Header names are case-insensitive, but AWS may represent them using
-    # different casing.
-    authorization = (
-        incoming_headers.get("authorization")
-        or incoming_headers.get("Authorization")
-    )
-
-    if not authorization:
-        return build_response(
-            status_code=401,
-            body=json.dumps({
-                "error": "Authentication required"
-            }),
-            cache_status="BYPASS"
-        )
-
-    # -----------------------------------------------------------------------
-    # GET REQUESTS: CHECK CACHE FIRST
-    # -----------------------------------------------------------------------
-
-    cache_key = None
-    resource_path = None
-
-    if method == "GET":
-
-        cache_key, resource_path = build_cache_key(
-            authorization,
-            path,
-            query_params
-        )
-
-        cached_body = get_from_cache(cache_key)
-
-        if cached_body is not None:
-
-            print(
-                f"CACHE HIT method={method} path={path} key={cache_key} " 
-            )
-
-            return build_response(
-                status_code=200,
-                body=cached_body,
-                cache_status="HIT"
-            )
-
-        print(
-            f"CACHE MISS method={method} path={path} key={cache_key}"
-        )
-
-    # -----------------------------------------------------------------------
-    # CALL HOSP
-    # -----------------------------------------------------------------------
-
-    response_body, status_code = fetch_from_hosp(
-        method=method,
-        path=path,
-        query_params=query_params,
-        incoming_headers=incoming_headers,
-        authorization=authorization,
-        body=body
-    )
-
-    # -----------------------------------------------------------------------
-    # CACHE SUCCESSFUL GET RESPONSES
-    # -----------------------------------------------------------------------
-
-    if method == "GET" and status_code == 200:
-
-        save_to_cache(
-            key=cache_key,
-            resource_path=resource_path,
-            body=response_body,
-            ttl_seconds=CACHE_TTL_SECONDS
-        )
-
-    # -----------------------------------------------------------------------
-    # INVALIDATE CACHE AFTER SUCCESSFUL WRITES
-    # -----------------------------------------------------------------------
-
-    if (
-        method in {"POST", "PUT", "PATCH", "DELETE"}
-        and status_code in {200, 201, 204}
-    ):
-        invalidate_related_cache(path)
-
-    return build_response(
-        status_code=status_code,
-        body=response_body,
-        cache_status="MISS" if method == "GET" else "BYPASS"
-    )
-
-
-# ---------------------------------------------------------------------------
-# CACHE KEY
-# ---------------------------------------------------------------------------
-
-def build_cache_key(authorization, path, query_params):
-    """
-    Creates a cache key unique to both:
-        - the authenticated caller
-        - the requested resource
-
-    We hash the Authorization header so credentials themselves are never
-    written to DynamoDB.
-
-    Example conceptual key:
-
-        7e63ab...:/notes?patient_id=3
+    Generates deterministic, route-aware cache keys.
+    Public/static routes (e.g. /hospitals) omit the authorization token
+    so all users share a single cache entry.
     """
     normalized_path = path.rstrip("/") or "/"
+    
+    # Sort query string for deterministic keys
+    query_string = urllib.parse.urlencode(sorted(query_params.items())) if query_params else ""
+    resource = f"{normalized_path}?{query_string}" if query_string else normalized_path
 
+    # Public route check: strip auth hash to allow shared cache across all users
+    if normalized_path in ["/hospitals"]:
+        raw_key = resource
+    else:
+        caller_hash = hashlib.sha256(authorization.encode("utf-8")).hexdigest()
+        raw_key = f"{caller_hash}:{resource}"
 
-    caller_hash = hashlib.sha256(
-        authorization.encode("utf-8")
-    ).hexdigest()
-
-    query_string = urllib.parse.urlencode(
-        sorted(query_params.items())
-    )
-
-    resource = normalized_path
-
-    if query_string:
-        resource = f"{normalized_path}?{query_string}"
-    cache_key = f"{caller_hash}:{resource}"
-
+    cache_key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
     return cache_key, normalized_path
 
 
 # ---------------------------------------------------------------------------
-# CACHE READ
+# CACHE OPERATIONS (READ / WRITE / INVALIDATE)
 # ---------------------------------------------------------------------------
 
-def get_from_cache(key):
+# MODIFIED: Updated to retrieve full item for Soft TTL + Hard TTL inspection
+def get_from_cache(key: str):
     """
-    Attempts to retrieve a cached response from DynamoDB.
-
-    DynamoDB TTL deletion is asynchronous, so an expired item might remain
-    in the table for some time. We therefore check ttl_timestamp ourselves
-    before using the value.
+    Retrieves cached item from DynamoDB if present.
+    Returns the raw DynamoDB item dict or None.
     """
-
     try:
-
-        response = cache_table.get_item(
-            Key={
-                "cache_key": key
-            }
-        )
-
-        item = response.get("Item")
-
-        if not item:
-            return None
-
-        expires_at = int(item["expires_at"])
-        current_time = int(time.time())
-
-        if expires_at <= current_time:
-            return None
-
-        # Keep this as a string because ALB expects body to be a string.
-        return item["data"]
-
+        response = cache_table.get_item(Key={"cache_key": key})
+        return response.get("Item")
     except Exception as error:
-
-        # Cache failure should not make the HOSP service unavailable.
-        print(
-            f"CACHE READ ERROR: {str(error)} "
-            
-        )
-
+        logger.error(f"CACHE READ ERROR: {str(error)}")
         return None
 
 
-# ---------------------------------------------------------------------------
-# CACHE WRITE
-# ---------------------------------------------------------------------------
-
-def save_to_cache(key, resource_path, body, ttl_seconds):
+# MODIFIED: Updated to accept soft_ttl and hard_ttl parameters and store JSON payloads
+def save_to_cache(key: str, resource_path: str, body_data: str, soft_ttl_sec: int, hard_ttl_sec: int):
     """
-    Saves a successful GET response in DynamoDB.
+    Saves payload with both soft_ttl (freshness) and hard_ttl (DynamoDB auto-cleanup).
     """
-
+    now = int(time.time())
     try:
-
-        expires_at = int(time.time()) + ttl_seconds
-
         cache_table.put_item(
             Item={
                 "cache_key": key,
                 "resource_path": resource_path,
-                "data": body,
-                "expires_at": expires_at
+                "data": body_data,
+                "soft_ttl": now + soft_ttl_sec,
+                "ttl": now + hard_ttl_sec  # DynamoDB native TTL attribute name
             }
         )
-        print(f"CACHE STORED key={key} ttl={ttl_seconds}s")
-
+        logger.info(f"CACHE STORED key={key} soft_ttl={soft_ttl_sec}s hard_ttl={hard_ttl_sec}s")
     except Exception as error:
-
-        # Caching is an optimisation. A failed cache write should not
-        # turn a successful HOSP response into a failed user request.
-        print(
-            f"CACHE WRITE ERROR: {str(error)}"
-        )
+        logger.error(f"CACHE WRITE ERROR: {str(error)}")
 
 
-# ---------------------------------------------------------------------------
-# CACHE INVALIDATION
-# ---------------------------------------------------------------------------
-
-def invalidate_related_cache(path):
+def invalidate_related_cache(path: str):
     """
-    Removes cached entries which may now be stale after a successful write.
-
-    Because cache keys contain a caller hash, and because multiple query
-    variants can exist, invalidation requires looking for cache keys
-    containing the relevant resource prefix.
-
-    This uses a DynamoDB scan.
-
-    That would not be desirable for a large production cache, but is
-    acceptable as an initial bootcamp implementation with a small table.
-
-    A production design would likely use a better cache-versioning or
-    invalidation strategy.
+    Invalidates cached entries associated with base path on successful writes.
     """
-
-    # Work out the collection/resource that may have changed.
-    #
-    # Examples:
-    #   /notes/12     -> /notes
-    #   /patients/3   -> /patients
-    #   /hospitals/4  -> /hospitals
-
     parts = path.strip("/").split("/")
-
     if not parts or not parts[0]:
         return
 
@@ -331,34 +138,20 @@ def invalidate_related_cache(path):
         response = cache_table.query(
             IndexName="ResourceIndex",
             KeyConditionExpression="resource_path = :path",
-            ExpressionAttributeValues={
-                ":path": base_path
-            },
-        
+            ExpressionAttributeValues={":path": base_path},
             ProjectionExpression="cache_key"
         )
         items_to_delete = response.get("Items", [])
         for item in items_to_delete:
-            cache_table.delete_item(
-                Key={
-                    "cache_key": item["cache_key"]
-                }
-            )
+            cache_table.delete_item(Key={"cache_key": item["cache_key"]})
 
-        print(
-            f"CACHE INVALIDATED base_path={base_path}"
-        )
-
+        logger.info(f"CACHE INVALIDATED base_path={base_path}")
     except Exception as error:
-
-        # Again: failure of the cache should not fail the user's write.
-        print(
-            f"CACHE INVALIDATION ERROR: {str(error)}"
-        )
+        logger.error(f"CACHE INVALIDATION ERROR: {str(error)}")
 
 
 # ---------------------------------------------------------------------------
-# HOSP REQUEST
+# HOSP UPSTREAM REQUEST
 # ---------------------------------------------------------------------------
 
 def fetch_from_hosp(
@@ -370,72 +163,26 @@ def fetch_from_hosp(
     body=None
 ):
     """
-    Forwards a request to the legacy HOSP backend.
-
-    Retry policy:
-
-        GET:
-            Retry once on:
-                - HTTP 500
-                - HTTP 503
-                - connection failure
-                - timeout
-
-        POST / PUT / PATCH / DELETE:
-            By default, do NOT retry.
-
-            If RETRY_WRITES_ON_5XX=true, retry a 500 or 503 once.
-
-            We deliberately do not automatically retry writes after
-            ambiguous network failures/timeouts because HOSP may already
-            have committed the change.
+    Forwards HTTP request to legacy HOSP backend with retry handling.
     """
-
     url = f"{HOSP_BASE_URL}{path}"
-
     if query_params:
-
-        query_string = urllib.parse.urlencode(
-            query_params
-        )
-
-        url += f"?{query_string}"
-
-    # -----------------------------------------------------------------------
-    # HEADERS
-    # -----------------------------------------------------------------------
+        url += f"?{urllib.parse.urlencode(query_params)}"
 
     outgoing_headers = {
         "Authorization": authorization,
         "Accept": "application/json"
     }
 
-    # Preserve Content-Type for POST/PATCH/etc.
     content_type = (
-        incoming_headers.get("content-type")
-        or incoming_headers.get("Content-Type")
+        incoming_headers.get("content-type") or incoming_headers.get("Content-Type")
     )
-
     if content_type:
         outgoing_headers["Content-Type"] = content_type
 
-    # -----------------------------------------------------------------------
-    # BODY
-    # -----------------------------------------------------------------------
-
-    request_body = None
-
-    if body is not None:
-
-        # ALB normally gives Lambda the request body as a string.
-        request_body = body.encode("utf-8")
-
-    # -----------------------------------------------------------------------
-    # ATTEMPTS
-    # -----------------------------------------------------------------------
+    request_body = body.encode("utf-8") if body is not None else None
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
-
         request = urllib.request.Request(
             url=url,
             data=request_body,
@@ -444,207 +191,59 @@ def fetch_from_hosp(
         )
 
         try:
-
-            print(
-                f"HOSP REQUEST "
-                f"method={method} "
-                f"path={path} "
-                f"attempt={attempt}"
-            )
-
-            with urllib.request.urlopen(
-                request,
-                timeout=UPSTREAM_TIMEOUT_SECONDS
-            ) as response:
-
-                response_body = (
-                    response.read().decode("utf-8")
-                )
-
-                print(
-                    f"HOSP RESPONSE "
-                    f"method={method} "
-                    f"path={path} "
-                    f"status={response.status} "
-                    f"attempt={attempt}"
-                )
-
-                return (
-                    response_body,
-                    response.status
-                )
-
-        # -------------------------------------------------------------------
-        # HOSP RETURNED AN HTTP ERROR
-        # -------------------------------------------------------------------
+            logger.info(f"HOSP REQUEST method={method} path={path} attempt={attempt}")
+            with urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT_SECONDS) as response:
+                response_body = response.read().decode("utf-8")
+                logger.info(f"HOSP RESPONSE method={method} path={path} status={response.status} attempt={attempt}")
+                return response_body, response.status
 
         except urllib.error.HTTPError as error:
-
             status_code = error.code
-            error_body = (
-                error.read().decode("utf-8")
-            )
+            error_body = error.read().decode("utf-8")
+            logger.warning(f"HOSP HTTP ERROR method={method} path={path} status={status_code} attempt={attempt}")
 
-            print(
-                f"HOSP HTTP ERROR "
-                f"method={method} "
-                f"path={path} "
-                f"status={status_code} "
-                f"attempt={attempt}"
-            )
+            transient_error = status_code in {500, 503}
+            attempts_remaining = attempt < MAX_ATTEMPTS
 
-            transient_error = (
-                status_code in {500, 503}
-            )
-
-            attempts_remaining = (
-                attempt < MAX_ATTEMPTS
-            )
-
-            # GET requests are safe to repeat.
-            if (
-                method == "GET"
-                and transient_error
-                and attempts_remaining
-            ):
-
-                print(
-                    f"RETRYING GET path={path}"
-                )
-
-                time.sleep(
-                    RETRY_DELAY_SECONDS
-                )
-
+            if method == "GET" and transient_error and attempts_remaining:
+                time.sleep(RETRY_DELAY_SECONDS)
                 continue
 
-            # Optional write retry.
             if (
                 method in {"POST", "PUT", "PATCH", "DELETE"}
                 and RETRY_WRITES_ON_5XX
                 and transient_error
                 and attempts_remaining
             ):
-
-                print(
-                    f"RETRYING WRITE "
-                    f"method={method} "
-                    f"path={path}"
-                )
-
-                time.sleep(
-                    RETRY_DELAY_SECONDS
-                )
-
+                time.sleep(RETRY_DELAY_SECONDS)
                 continue
 
-            # Return HOSP's actual HTTP error.
-            return (
-                error_body,
-                status_code
-            )
-
-        # -------------------------------------------------------------------
-        # NETWORK / DNS / CONNECTION FAILURE
-        # -------------------------------------------------------------------
+            return error_body, status_code
 
         except urllib.error.URLError:
-
-            print(
-                f"HOSP CONNECTION ERROR "
-                f"method={method} "
-                f"path={path} "
-                f"attempt={attempt}"
-            )
-
-            # A GET can safely be repeated.
-            if (
-                method == "GET"
-                and attempt < MAX_ATTEMPTS
-            ):
-
-                time.sleep(
-                    RETRY_DELAY_SECONDS
-                )
-
+            logger.error(f"HOSP CONNECTION ERROR method={method} path={path} attempt={attempt}")
+            if method == "GET" and attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_DELAY_SECONDS)
                 continue
-
-            # For a write, we don't know whether HOSP performed the action.
-            return (
-                json.dumps({
-                    "error": "Unable to contact HOSP"
-                }),
-                502
-            )
-
-        # -------------------------------------------------------------------
-        # TIMEOUT
-        # -------------------------------------------------------------------
+            return json.dumps({"error": "Unable to contact HOSP"}), 502
 
         except TimeoutError:
-
-            print(
-                f"HOSP TIMEOUT "
-                f"method={method} "
-                f"path={path} "
-                f"attempt={attempt}"
-            )
-
-            if (
-                method == "GET"
-                and attempt < MAX_ATTEMPTS
-            ):
-
-                time.sleep(
-                    RETRY_DELAY_SECONDS
-                )
-
+            logger.error(f"HOSP TIMEOUT method={method} path={path} attempt={attempt}")
+            if method == "GET" and attempt < MAX_ATTEMPTS:
+                time.sleep(RETRY_DELAY_SECONDS)
                 continue
+            return json.dumps({"error": "HOSP timed out"}), 504
 
-            return (
-                json.dumps({
-                    "error": "HOSP timed out"
-                }),
-                504
-            )
-
-    # Should normally never reach here.
-    return (
-        json.dumps({
-            "error": "Unexpected proxy failure"
-        }),
-        502
-    )
+    return json.dumps({"error": "Unexpected proxy failure"}), 502
 
 
 # ---------------------------------------------------------------------------
-# ALB RESPONSE
+# ALB RESPONSE FORMATTER
 # ---------------------------------------------------------------------------
 
-def build_response(
-    status_code,
-    body,
-    cache_status
-):
-    """
-    Formats a response in the structure expected by an ALB Lambda target.
-
-    X-Proxy-Cache makes testing easier in Insomnia:
-
-        HIT
-            Response came from DynamoDB.
-
-        MISS
-            Cache did not contain the response, so HOSP was contacted.
-
-        BYPASS
-            Request was not eligible for caching.
-    """
-
-    # ALB requires the body to be a string.
+def build_response(status_code, body, cache_status):
     if body is None:
         body = ""
-
     elif not isinstance(body, str):
         body = json.dumps(body)
 
@@ -658,70 +257,115 @@ def build_response(
         "body": body
     }
 
-# ------------------------------------------------------------------
-# HANDLER HELPERS
-# ------------------------------------------------------------------
 
-def get_cached_item(cache_key: str):
-    try:
-        response = table.get_item(Key={'cache_key': cache_key})
-        return response.get('Item')
-    except (BotoCoreError, ClientError) as e:
-        logger.error(f"DynamoDB read error: {str(e)}")
-    return None
+# ---------------------------------------------------------------------------
+# MAIN LAMBDA HANDLER
+# ---------------------------------------------------------------------------
 
-def save_to_cache(cache_key: str, payload: dict, soft_ttl_sec: int, hard_ttl_sec: int):
-    now = int(time.time())
-    try:
-        table.put_item(
-            Item={
-                'cache_key': cache_key,
-                'payload': json.dumps(payload),
-                'soft_ttl': now + soft_ttl_sec,
-                'ttl': now + hard_ttl_sec # Used by DynamoDB TTL feature
-            }
+def lambda_handler(event, context):
+    """
+    Main Lambda entry point.
+    Handles route-aware caching, serve-stale-on-error, and mutation invalidation.
+    """
+    method = event.get("httpMethod", "GET").upper()
+    path = event.get("path", "/")
+    query_params = event.get("queryStringParameters") or {}
+    incoming_headers = event.get("headers") or {}
+    body = event.get("body")
+
+    authorization = (
+        incoming_headers.get("authorization") or incoming_headers.get("Authorization")
+    )
+
+    if not authorization:
+        return build_response(
+            status_code=401,
+            body=json.dumps({"error": "Authentication required"}),
+            cache_status="BYPASS"
         )
-    except (BotoCoreError, ClientError) as e:
-        logger.error(f"DynamoDB write error: {str(e)}")
 
+    # -----------------------------------------------------------------------
+    # GET REQUEST PROCESSING: FRESH HIT / UPSTREAM FETCH / SERVE STALE
+    # -----------------------------------------------------------------------
+    if method == "GET":
+        # MODIFIED: Generates route-aware key (shared for /hospitals, token-bound for others)
+        cache_key, resource_path = generate_cache_key(authorization, path, query_params)
+        now = int(time.time())
+        
+        cached_item = get_from_cache(cache_key)
 
-# ------------------------------------------------------------------
-# REQUEST PROCESSING LOGIC
-# ------------------------------------------------------------------
+        # 1. Fresh Cache Hit (now < soft_ttl)
+        if cached_item and now < int(cached_item.get("soft_ttl", 0)):
+            logger.info(f"CACHE HIT method={method} path={path} key={cache_key}")
+            return build_response(
+                status_code=200,
+                body=cached_item["data"],
+                cache_status="HIT"
+            )
 
-def handle_get_request(auth_token: str, path: str, query_string: str):
-    cache_key = generate_cache_key(auth_token, path, query_string)
-    now = int(time.time())
+        logger.info(f"CACHE MISS/EXPIRED method={method} path={path} key={cache_key}")
 
-    cached_item = get_cached_item(cache_key)
+        # 2. Upstream Fetch
+        soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
+        
+        response_body, status_code = fetch_from_hosp(
+            method=method,
+            path=path,
+            query_params=query_params,
+            incoming_headers=incoming_headers,
+            authorization=authorization,
+            body=body
+        )
 
-    # 1. Fresh Cache Hit
-    if cached_item and now < cached_item.get('soft_ttl', 0):
-        logger.info(f"CACHE HIT path={path} key={cache_key}")
-        return build_response(200, json.loads(cached_item['payload']))
+        # 3. Successful Upstream Response: Store to Cache
+        if status_code == 200:
+            save_to_cache(
+                key=cache_key,
+                resource_path=resource_path,
+                body_data=response_body,
+                soft_ttl_sec=soft_ttl_sec,
+                hard_ttl_sec=hard_ttl_sec
+            )
+            return build_response(
+                status_code=200,
+                body=response_body,
+                cache_status="MISS"
+            )
 
-    logger.info(f"CACHE MISS/EXPIRED path={path} key={cache_key}")
+        # 4. ADDED: Serve Stale on Upstream Error Fallback
+        if cached_item and "data" in cached_item:
+            logger.warning(f"UPSTREAM FAILED (status={status_code}). SERVING STALE DATA key={cache_key}")
+            return build_response(
+                status_code=200,
+                body=cached_item["data"],
+                cache_status="STALE"
+            )
 
-    # 2. Attempt Upstream Fetch
-    soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
-    try:
-        upstream_res = fetch_from_hosp(path, query_string, auth_token)
+        # 5. Upstream Failed & No Cache Backup Available
+        return build_response(
+            status_code=status_code,
+            body=response_body,
+            cache_status="MISS"
+        )
 
-        if upstream_res.status_code == 200:
-            payload = upstream_res.json()
-            save_to_cache(cache_key, payload, soft_ttl_sec, hard_ttl_sec)
-            return build_response(200, payload)
-        else:
-            raise Exception(f"Upstream returned status {upstream_res.status_code}")
+    # -----------------------------------------------------------------------
+    # NON-GET MUTATIONS (POST, PUT, PATCH, DELETE)
+    # -----------------------------------------------------------------------
+    response_body, status_code = fetch_from_hosp(
+        method=method,
+        path=path,
+        query_params=query_params,
+        incoming_headers=incoming_headers,
+        authorization=authorization,
+        body=body
+    )
 
-    except Exception as err:
-        logger.warning(f"Upstream request failed: {str(err)}")
+    # Invalidate cache if write succeeded
+    if status_code in {200, 201, 204}:
+        invalidate_related_cache(path)
 
-        # 3. Serve Stale on Upstream Error Fallback
-        if cached_item and 'payload' in cached_item:
-            logger.info(f"SERVING STALE DATA path={path} key={cache_key}")
-            return build_response(200, json.loads(cached_item['payload']))
-
-        # 4. Final Failure if no cached data exists at all
-        logger.error(f"NO CACHE FALLBACK AVAILABLE path={path}")
-        return build_response(502, {"error": "Upstream service unavailable"})
+    return build_response(
+        status_code=status_code,
+        body=response_body,
+        cache_status="BYPASS"
+    )
