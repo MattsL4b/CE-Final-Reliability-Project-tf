@@ -32,6 +32,7 @@ data "archive_file" "proxy_payload" {
   type        = "zip"
   source_dir  = "${path.module}/lambda_src"
   output_path = "${path.module}/lambda_payload.zip"
+  excludes    = ["__pycache__", "__pycache__/*"]
 }
 
 # ==========================================
@@ -47,9 +48,19 @@ resource "aws_dynamodb_table" "cache" {
     name = "cache_key"
     type = "S"
   }
+  attribute {
+    name = "resource_path"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name = "ResourceIndex"
+    hash_key = "resource_path"
+    projection_type = "KEYS_ONLY"
+  }
 
   ttl {
-    attribute_name = "ttl"
+    attribute_name = "expires_at"
     enabled        = true
   }
 
@@ -92,9 +103,14 @@ resource "aws_iam_policy" "lambda_dynamodb_cache" {
           "dynamodb:GetItem",
           "dynamodb:PutItem",
           "dynamodb:DeleteItem",
-          "dynamodb:Scan"
+          "dynamodb:Scan",
+          "dynamodb:CreateTable",
+          "dynamodb:Query"
         ]
-        Resource = aws_dynamodb_table.cache.arn
+        Resource = [
+          aws_dynamodb_table.cache.arn,
+          "${aws_dynamodb_table.cache.arn}/index/*"
+        ] 
       },
       {
         Effect = "Allow"
@@ -117,7 +133,7 @@ resource "aws_iam_role_policy_attachment" "attach_cache_policy" {
 # Grants permissions to create ENIs inside the VPC
 resource "aws_iam_role_policy_attachment" "lambda_vpc_access" {
   role       = aws_iam_role.lambda_exec.name
-  policy_arn = "arn:aws:iam::aws:policy/service/role/AWSLambdaVPCAccessExecutionRole"
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
 }
 
 # ==========================================
@@ -129,19 +145,26 @@ resource "aws_security_group" "lambda_sg" {
   description = "Security group for Lambda proxy shield"
   vpc_id      = "vpc-080dbb0b7dc86503a"
 
-  # Outbound HTTP access to HOSP private IP
-  egress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["172.31.39.164/32"]
+  ingress {
+    from_port = 80
+    to_port   = 80
+    protocol  = "tcp"
+    self      = true
   }
 
-  # Outbound HTTPS for AWS Services (CloudWatch, IAM, etc.)
+  ingress {
+    from_port = 443
+    to_port   = 443
+    protocol  = "tcp"
+    self      = true
+  }
+
+
+  # Outbound to HOSP, the VPC DNS resolver, and AWS service endpoints
   egress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
@@ -155,11 +178,27 @@ resource "aws_vpc_endpoint" "dynamodb" {
   vpc_id            = "vpc-080dbb0b7dc86503a"
   service_name      = "com.amazonaws.eu-west-2.dynamodb"
   vpc_endpoint_type = "Gateway"
+  route_table_ids   = ["rtb-0020e3ad9b254dde8"]
 
   tags = {
     Name = "dynamodb-vpc-endpoint"
   }
 }
+
+# Interface endpoint so the VPC Lambda can ship logs to CloudWatch
+resource "aws_vpc_endpoint" "logs" {
+  vpc_id              = "vpc-080dbb0b7dc86503a"
+  service_name        = "com.amazonaws.eu-west-2.logs"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = ["subnet-09f2ffa366a8abe67", "subnet-0fc0a94296b831a31"]
+  security_group_ids  = [aws_security_group.lambda_sg.id]
+  private_dns_enabled = true
+
+  tags = {
+    Name = "logs-vpc-endpoint"
+  }
+}
+
 
 # ==========================================
 # 5. ALB TARGET GROUP & CANARY ROUTING
@@ -195,7 +234,7 @@ resource "aws_lb_target_group_attachment" "lambda_proxy" {
 
 variable "proxy_weight" {
   type        = number
-  default     = 0 # Safe default: 0% traffic to Lambda proxy
+  default     = 100 # Safe default: 0% traffic to Lambda proxy
   description = "Percentage of traffic to send to the Lambda proxy (0-100)"
 }
 
@@ -245,7 +284,7 @@ resource "aws_lambda_function" "proxy_shield" {
   timeout          = 25 # Accommodates slow HOSP calls + retries
 
   # Protect Puma from thread exhaustion by capping concurrency
-  reserved_concurrent_executions = 5
+  reserved_concurrent_executions = 10
 
   vpc_config {
     subnet_ids = [
@@ -257,9 +296,10 @@ resource "aws_lambda_function" "proxy_shield" {
 
   environment {
     variables = {
-      CACHE_TABLE_NAME  = aws_dynamodb_table.cache.name
-      HOSP_BACKEND_URL  = "http://172.31.39.164"
-      CACHE_TTL_SECONDS = "20" # Enforced as string
+      CACHE_TABLE_NAME    = aws_dynamodb_table.cache.name
+      HOSP_BACKEND_URL    = "http://172.31.39.164"
+      CACHE_TTL_SECONDS   = "300" # Enforced as string
+      RETRY_WRITES_ON_5XX = "true"
     }
   }
 

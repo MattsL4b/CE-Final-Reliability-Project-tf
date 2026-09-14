@@ -18,12 +18,14 @@ aws.json
 *.tfstate.*
 *.tfplan
 tfplan
+lambda_payload.zip
 crash.log
 crash.*.log
 override.tf
 override.tf.json
 *_override.tf
 *_override.tf.json
+
 # keep .terraform.lock.hcl committed — pins provider versions for the team
 
 # ---- OS / editor ----
