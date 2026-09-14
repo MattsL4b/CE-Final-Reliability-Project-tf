@@ -9,6 +9,7 @@ import logging
 import boto3
 import botocore
 from botocore.exceptions import BotoCoreError, ClientError
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -37,21 +38,22 @@ CACHE_TABLE_NAME = os.environ["CACHE_TABLE_NAME"]
 # MODIFIED: Removed fallback CACHE_TTL_SECONDS as we now use get_ttl_config()
 
 RETRY_WRITES_ON_5XX = (
-    os.environ.get("RETRY_WRITES_ON_5XX", "false").lower() == "true"
+    os.environ.get("RETRY_WRITES_ON_5XX", "true").lower() == "true"
 )
 
 # One normal request + one retry.
 MAX_ATTEMPTS = 2
 
 # HOSP has already been observed taking several seconds to respond.
-UPSTREAM_TIMEOUT_SECONDS = 12
+UPSTREAM_TIMEOUT_SECONDS = 3.5
 
 # Small delay before retrying.
-RETRY_DELAY_SECONDS = 0.2
+RETRY_DELAY_SECONDS = 0.1
 
 # Create the DynamoDB resource outside the handler for warm invocation reuse.
 dynamodb = boto3.resource("dynamodb")
 cache_table = dynamodb.Table(CACHE_TABLE_NAME)
+executor = ThreadPoolExecutor(max_workers=2)
 
 
 
@@ -100,10 +102,22 @@ def lambda_handler(event, context):
                 body=cached_item["data"],
                 cache_status="HIT"
             )
+            # Stale-While-Revalidate (SWR) path
+        if cached_item and "data" in cached_item:
+            logger.info(f"CACHE STALE (SWR) - Returning stale data instantly & refreshing in background key={cache_key}")
+            executor.submit(
+                _async_revalidate,
+                method, path, query_params, incoming_headers, authorization, cache_key, resource_path
+            )
+            return build_response(
+                status_code=200,
+                body=cached_item["data"],
+                cache_status="STALE"
+            )
 
-        logger.info(f"CACHE MISS/EXPIRED method={method} path={path} key={cache_key}")
+        # Cache Cold Miss: No cached item exists at all, synchronous upstream fetch required
+        logger.info(f"CACHE COLD MISS method={method} path={path} key={cache_key}")
 
-        # 2. Upstream Fetch
         soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
         
         response_body, status_code = fetch_from_hosp(
@@ -114,6 +128,14 @@ def lambda_handler(event, context):
             authorization=authorization,
             body=body
         )
+# MODIFIED: Fallback to hard_ttl item if upstream fetch times out on a cold miss (if expired item exists)
+        if status_code in {502, 504} and cached_item and "data" in cached_item:
+            logger.warning(f"UPSTREAM FAILED - Falling back to hard TTL cached data key={cache_key}")
+            return build_response(
+                status_code=200,
+                body=cached_item["data"],
+                cache_status="STALE_FALLBACK"
+            )    
 
         # 3. Successful Upstream Response: Store to Cache
         if status_code == 200:
@@ -160,7 +182,7 @@ def lambda_handler(event, context):
 
     # Invalidate cache if write succeeded
     if status_code in {200, 201, 204}:
-        invalidate_related_cache(path)
+        invalidate_related_cache(path, authorization)
 
     return build_response(
         status_code=status_code,
@@ -237,7 +259,7 @@ def save_to_cache(key: str, resource_path: str, body_data: str, soft_ttl_sec: in
         logger.error(f"CACHE WRITE ERROR: {str(error)}")
 
 
-def invalidate_related_cache(path: str):
+def invalidate_related_cache(path: str, authorization: str = None):
     """
     Invalidates cached entries associated with base path on successful writes.
     """
@@ -245,24 +267,50 @@ def invalidate_related_cache(path: str):
     if not parts or not parts[0]:
         return
 
-    base_path = f"/{parts[0]}"
-
+    target_path = f"/{'/'.join(parts[:2])}" if len(parts) >= 2 else f"/{parts[0]}"
+        
     try:
         response = cache_table.query(
             IndexName="ResourceIndex",
             KeyConditionExpression="resource_path = :path",
-            ExpressionAttributeValues={":path": base_path},
+            ExpressionAttributeValues={":path": target_path},
             ProjectionExpression="cache_key"
         )
-        items_to_delete = response.get("Items", [])
-        for item in items_to_delete:
+        for item in response.get("Items",[]):
             cache_table.delete_item(Key={"cache_key": item["cache_key"]})
 
-        logger.info(f"CACHE INVALIDATED base_path={base_path}")
+        logger.info(f"CACHE INVALIDATED base_path={target_path}")
     except Exception as error:
         logger.error(f"CACHE INVALIDATION ERROR: {str(error)}")
 
 
+# ---------------------------------------------------------------------------
+# ASYNC REVALIDATION WORKER
+# ---------------------------------------------------------------------------
+
+def _async_revalidate(method, path, query_params, incoming_headers, authorization, cache_key, resource_path):
+    try:
+        logger.info(f"SWR ASYNC REVALIDATION START path={path} key={cache_key}")
+        response_body, status_code = fetch_from_hosp(
+            method=method,
+            path=path,
+            query_params=query_params,
+            incoming_headers=incoming_headers,
+            authorization=authorization,
+            body=None
+        )
+        if status_code == 200:
+            soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
+            save_to_cache(
+                key=cache_key,
+                resource_path=resource_path,
+                body_data=response_body,
+                soft_ttl_sec=soft_ttl_sec,
+                hard_ttl_sec=hard_ttl_sec
+            )
+            logger.info(f"SWR ASYNC REVALIDATION SUCCESS key={cache_key}")
+    except Exception as err:
+        logger.error(f"SWR ASYNC REVALIDATION FAILED key={cache_key} error={str(err)}")
 
 
 
@@ -345,7 +393,7 @@ def fetch_from_hosp(
 
         except TimeoutError:
             logger.error(f"HOSP TIMEOUT method={method} path={path} attempt={attempt}")
-            if method == "GET" and attempt < MAX_ATTEMPTS:
+            if method == "GET" or (method in {"POST", "PUT", "PATCH"} and RETRY_WRITES_ON_5XX) and attempts_remaining:
                 time.sleep(RETRY_DELAY_SECONDS)
                 continue
             return json.dumps({"error": "HOSP timed out"}), 504
