@@ -42,16 +42,16 @@ CACHE_TABLE_NAME = os.environ["CACHE_TABLE_NAME"]
 RETRY_WRITES_ON_5XX = (
     os.environ.get("RETRY_WRITES_ON_5XX", "true").lower() == "true"
 )
-
 # One normal request + one retry.
 MAX_ATTEMPTS = 2
-
 # HOSP has already been observed taking several seconds to respond.
-GET_TIMEOUT_SECONDS = 15
+GET_TIMEOUT_SECONDS = 10
 WRITE_TIMEOUT_SECONDS = 5
-
 # Small delay before retrying.
 RETRY_DELAY_SECONDS = 0.1
+
+FRESH_TTL_SECONDS = 300
+STALE_GRACE_SECONDS = 86400
 
 # Create the DynamoDB resource outside the handler for warm invocation reuse.
 dynamodb = boto3.resource("dynamodb")
@@ -68,6 +68,44 @@ def extract_base_resource_path(path: str) -> str:
         return "/"
     return f"/{'/'.join(parts[:2])}" if len(parts) >= 2 else f"/{parts[0]}"
 
+# Attempts to acquire a distributed lock in DynamoDB to prevent concurrent upstream requests.
+def acquire_lock(cache_key:str) -> bool:
+    lock_key = f"LOCK#{cache_key}"
+    now = int(time.time())
+    ttl = now + 15 # auto expire stale lock after 15s
+
+    try:
+        cache_table.put_item(
+            Item={
+                "cache_key": lock_key,
+                "expires_at": ttl
+            },
+            ConditionExpression="attribute_not_exists(cache_key) OR expires_at < :now",
+            ExpressionAttributeValues={":now": now}
+        )
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return False
+        logger.error(f"LOCK ACQUIRE ERROR: {str(e)}")
+        return False
+
+    # Releases the lock after an upstream fetch completes.
+def release_lock(cache_key: str):
+    lock_key = f"LOCK#{cache_key}"
+    try:
+        cache_table.delete_item(Key={"cache_key": lock_key})
+    except Exception as e:
+        logger.error(f"LOCK RELEASE ERROR: {str(e)}")
+
+# Polls DynamoDB while another request fetches upstream data.
+def wait_for_cache(cache_key: str, poll_interval=0.2, max_retries=15):
+    for _ in range(max_retries):
+        time.sleep(poll_interval)
+        cached_item = get_from_cache(cache_key)
+        if cached_item and "data" in cached_item:
+            return cached_item
+    return None
 
 # ---------------------------------------------------------------------------
 # MAIN LAMBDA HANDLER
@@ -111,56 +149,71 @@ def lambda_handler(event, context):
                 cache_status="HIT"
             )
 
-        # 2. Stale Cache Hit - Try upstream; fallback instantly to stale data if upstream fails
-        if cached_item and "data" in cached_item:
-            logger.info(f"CACHE STALE - Fetching revalidation key={cache_key}")
+        got_lock = acquire_lock(cache_key)
+        if not got_lock:
+            logger.info(f"LOCK HELD BY ANOTHER REQUEST - Polling cache key={cache_key}")
+            waited_item = wait_for_cache(cache_key)
+            if waited_item and "data" in waited_item:
+                logger.info(f"CACHE HIT (COLLAPSED) key={cache_key}")
+                return build_response(
+                    status_code=200,
+                    body=waited_item["data"],
+                    cache_status="HIT"
+                )
+        try:
+            # 2. Stale Cache Hit - Try upstream; fallback instantly to stale data if upstream fails
+            if cached_item and "data" in cached_item:
+                logger.info(f"CACHE STALE - Fetching revalidation key={cache_key}")
+                soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
+
+                upstream_body, upstream_status = fetch_from_hosp(
+                    method=method, path=path, query_params=query_params,
+                    incoming_headers=incoming_headers, authorization=authorization, body=body, context=context
+                )
+
+                if upstream_status == 200:
+                    save_to_cache(cache_key, resource_base_path, upstream_body, soft_ttl_sec, hard_ttl_sec)
+                    return build_response(
+                        status_code=200,
+                        body=upstream_body,
+                        cache_status="REVALIDATED"
+                    )
+
+                logger.warning(f"Revalidation failed (status={upstream_status}). Serving stale cache")
+                return build_response(
+                    status_code=200,
+                    body=cached_item["data"],
+                    cache_status="STALE"
+                )
+
+            # 3. Cache Cold Miss - Fetch upstream and write to cache
+            logger.info(f"CACHE COLD MISS method={method} path={path} key={cache_key}")
             soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
 
             upstream_body, upstream_status = fetch_from_hosp(
                 method=method, path=path, query_params=query_params,
-                incoming_headers=incoming_headers, authorization=authorization, body=body
+                incoming_headers=incoming_headers, authorization=authorization, body=body, context=context
             )
-            
+
             if upstream_status == 200:
                 save_to_cache(cache_key, resource_base_path, upstream_body, soft_ttl_sec, hard_ttl_sec)
                 return build_response(
                     status_code=200,
                     body=upstream_body,
-                    cache_status="REVALIDATED"
+                    cache_status="MISS"
                 )
-            
-            logger.warning(f"Revalidation failed (status={upstream_status}). Serving stale cache")
+
             return build_response(
-                status_code=200,
-                body=cached_item["data"],
-                cache_status="STALE"
-            )
-
-        # 3. Cache Cold Miss - Fetch upstream and write to cache
-        logger.info(f"CACHE COLD MISS method={method} path={path} key={cache_key}")
-        soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
-
-        upstream_body, upstream_status = fetch_from_hosp(
-            method=method, path=path, query_params=query_params,
-            incoming_headers=incoming_headers, authorization=authorization, body=body
-        )
-
-        if upstream_status == 200:
-            save_to_cache(cache_key, resource_base_path, upstream_body, soft_ttl_sec, hard_ttl_sec)
-            return build_response(
-                status_code=200,
-                body=upstream_body,
+                status_code=upstream_status,
+                body=upstream_body or json.dumps({
+                    "error": "Gateway Timeout" if upstream_status == 504 else "Upstream service failure",
+                    "message": f"Upstream HOSP service failed to respond within timeout window."
+                }),
                 cache_status="MISS"
-            )
-
-        return build_response(
-            status_code=upstream_status,
-            body=upstream_body or json.dumps({
-                "error": "Gateway Timeout" if upstream_status == 504 else "Upstream service failure",
-                "message": f"Upstream HOSP service failed to respond within timeout window."
-            }),
-            cache_status="MISS"
-        )          
+            )     
+        finally:
+            if got_lock: 
+                release_lock(cache_key)    
 
     # -----------------------------------------------------------------------
     # NON-GET MUTATIONS (POST, PUT, PATCH, DELETE)
@@ -171,7 +224,8 @@ def lambda_handler(event, context):
         query_params=query_params,
         incoming_headers=incoming_headers,
         authorization=authorization,
-        body=body
+        body=body,
+        context=context
     )
 
     # Invalidate cache if write succeeded
@@ -187,8 +241,6 @@ def lambda_handler(event, context):
 # ---------------------------------------------------------------------------
 # CACHE KEY GENERATION
 # ---------------------------------------------------------------------------
-
-# MODIFIED: Replaced build_cache_key with route-aware generate_cache_key
 def generate_cache_key(authorization: str, path: str, query_params: dict) -> tuple[str, str]:
     """
     Generates deterministic, route-aware cache keys.
@@ -287,7 +339,8 @@ def fetch_from_hosp(
     query_params,
     incoming_headers,
     authorization,
-    body=None
+    body=None,
+    context=None
 ):
     url = f"{HOSP_BASE_URL}{path}"
     if query_params:
@@ -309,6 +362,11 @@ def fetch_from_hosp(
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         attempts_remaining = attempt < MAX_ATTEMPTS
+
+        if context and context.get_remaining_time_in_millis() < 3000:
+            logger.error("Aborting retry: Lambda execution time budget exhausted.")
+            break
+
         request = urllib.request.Request(
             url=url,
             data=request_body,
