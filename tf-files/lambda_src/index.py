@@ -83,13 +83,15 @@ def trigger_asynchronous_revalidation(cache_key: str, path: str, query_params: d
         "authorization": authorization
     }
 
+    send_args = {
+        "QueueUrl": REVALIDATION_QUEUE_URL,
+        "MessageBody": json.dumps(payload),
+    }
+    if REVALIDATION_QUEUE_URL.endswith(".fifo"):
+        send_args["MessageDeduplicationId"] = cache_key
+        send_args["MessageGroupId"] = "revalidation"
     try:
-        sqs.send_message(
-            QueueUrl=REVALIDATION_QUEUE_URL,
-            MessageBody=json.dumps(payload),
-            MessageDeduplicationId=cache_key if REVALIDATION_QUEUE_URL.endswith(".fifo") else None,
-            MessageGroupId="revalidation" if REVALIDATION_QUEUE_URL.endswith(".fifo") else None
-        )     
+        sqs.send_message(**send_args) 
         logger.info(f"ASYNC REVALIDATION ENQUEUED key={cache_key}")
     except Exception as e:
         logger.error(f"FAILED TO ENQUEUE ASYNC REVALIDATION key={cache_key} err={str(e)}")
