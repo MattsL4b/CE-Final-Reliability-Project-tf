@@ -5,6 +5,7 @@ import hashlib
 import urllib.request
 import urllib.error
 import urllib.parse
+import socket
 import logging
 import boto3
 import botocore
@@ -43,11 +44,11 @@ RETRY_WRITES_ON_5XX = (
 )
 
 # One normal request + one retry.
-MAX_ATTEMPTS = 1
+MAX_ATTEMPTS = 2
 
 # HOSP has already been observed taking several seconds to respond.
-GET_TIMEOUT_SECONDS = 8
-WRITE_TIMEOUT_SECONDS = 5.0
+GET_TIMEOUT_SECONDS = 15
+WRITE_TIMEOUT_SECONDS = 5
 
 # Small delay before retrying.
 RETRY_DELAY_SECONDS = 0.1
@@ -57,7 +58,15 @@ dynamodb = boto3.resource("dynamodb")
 cache_table = dynamodb.Table(CACHE_TABLE_NAME)
 
 
-
+def extract_base_resource_path(path: str) -> str:
+    """
+    Extracts the root resource identifier (up to 2 segments) for cache invalidation.
+    Example: '/patients/123/notes' -> '/patients/123'
+    """
+    parts = path.strip("/").split("/")
+    if not parts or not parts[0]:
+        return "/"
+    return f"/{'/'.join(parts[:2])}" if len(parts) >= 2 else f"/{parts[0]}"
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +98,7 @@ def lambda_handler(event, context):
     logger.info(f"INCOMING REQUEST path={path} query_params={query_params}")
     
     if method == "GET":
-        cache_key, resource_path = generate_cache_key(authorization, path, query_params)
+        cache_key, resource_base_path = generate_cache_key(authorization, path, query_params)
         now = int(time.time())
         cached_item = get_from_cache(cache_key)
 
@@ -113,11 +122,11 @@ def lambda_handler(event, context):
             )
             
             if upstream_status == 200:
-                save_to_cache(cache_key, resource_path, upstream_body, soft_ttl_sec, hard_ttl_sec)
+                save_to_cache(cache_key, resource_base_path, upstream_body, soft_ttl_sec, hard_ttl_sec)
                 return build_response(
                     status_code=200,
                     body=upstream_body,
-                    cache_status="HIT"
+                    cache_status="REVALIDATED"
                 )
             
             logger.warning(f"Revalidation failed (status={upstream_status}). Serving stale cache")
@@ -137,7 +146,7 @@ def lambda_handler(event, context):
         )
 
         if upstream_status == 200:
-            save_to_cache(cache_key, resource_path, upstream_body, soft_ttl_sec, hard_ttl_sec)
+            save_to_cache(cache_key, resource_base_path, upstream_body, soft_ttl_sec, hard_ttl_sec)
             return build_response(
                 status_code=200,
                 body=upstream_body,
@@ -146,9 +155,12 @@ def lambda_handler(event, context):
 
         return build_response(
             status_code=upstream_status,
-            body=upstream_body or json.dumps({"error": "Upstream service failure"}),
+            body=upstream_body or json.dumps({
+                "error": "Gateway Timeout" if upstream_status == 504 else "Upstream service failure",
+                "message": f"Upstream HOSP service failed to respond within timeout window."
+            }),
             cache_status="MISS"
-        )           
+        )          
 
     # -----------------------------------------------------------------------
     # NON-GET MUTATIONS (POST, PUT, PATCH, DELETE)
@@ -164,7 +176,7 @@ def lambda_handler(event, context):
 
     # Invalidate cache if write succeeded
     if status_code in {200, 201, 204}:
-        invalidate_related_cache(path, authorization)
+        invalidate_related_cache(path)
 
     return build_response(
         status_code=status_code,
@@ -194,14 +206,15 @@ def generate_cache_key(authorization: str, path: str, query_params: dict) -> tup
     resource = f"{normalized_path}?{query_string}" if query_string else normalized_path
 
     # Public route check: strip auth hash to allow shared cache across all users
-    if normalized_path.startswith(("/hospitals", "/patients", "/notes")):
+    if normalized_path.startswith(("/hospitals")):
         raw_key = resource
     else:
         caller_hash = hashlib.sha256(authorization.encode("utf-8")).hexdigest()
         raw_key = f"{caller_hash}:{resource}"
 
     cache_key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
-    return cache_key, normalized_path
+    resource_base_path = extract_base_resource_path(normalized_path)
+    return cache_key, resource_base_path
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +234,7 @@ def get_from_cache(key: str):
         return None
 
 
-def save_to_cache(key: str, resource_path: str, body_data: str, soft_ttl_sec: int, hard_ttl_sec: int):
+def save_to_cache(key: str, resource_base_path: str, body_data: str, soft_ttl_sec: int, hard_ttl_sec: int):
     """
     Saves payload with both soft_ttl (freshness) and hard_ttl (DynamoDB auto-cleanup).
     """
@@ -230,7 +243,7 @@ def save_to_cache(key: str, resource_path: str, body_data: str, soft_ttl_sec: in
         cache_table.put_item(
             Item={
                 "cache_key": key,
-                "resource_path": resource_path,
+                "resource_path": resource_base_path,
                 "data": body_data,
                 "soft_ttl": now + soft_ttl_sec,
                 "expires_at": now + hard_ttl_sec  # DynamoDB native TTL attribute name (ttl key in main.tf)
@@ -241,15 +254,14 @@ def save_to_cache(key: str, resource_path: str, body_data: str, soft_ttl_sec: in
         logger.error(f"CACHE WRITE ERROR: {str(error)}")
 
 
-def invalidate_related_cache(path: str, authorization: str = None):
+def invalidate_related_cache(path: str):
     """
     Invalidates cached entries associated with base path on successful writes.
     """
-    parts = path.strip("/").split("/")
-    if not parts or not parts[0]:
-        return
 
-    target_path = f"/{'/'.join(parts[:2])}" if len(parts) >= 2 else f"/{parts[0]}"
+    target_path = extract_base_resource_path(path)
+    if target_path == "/":
+        return
         
     try:
         response = cache_table.query(
@@ -277,9 +289,6 @@ def fetch_from_hosp(
     authorization,
     body=None
 ):
-    """
-    Forwards HTTP request to legacy HOSP backend with retry handling.
-    """
     url = f"{HOSP_BASE_URL}{path}"
     if query_params:
         url += f"?{urllib.parse.urlencode(query_params)}"
@@ -296,7 +305,7 @@ def fetch_from_hosp(
         outgoing_headers["Content-Type"] = content_type
 
     request_body = body.encode("utf-8") if body is not None else None
-    timeout = GET_TIMEOUT_SECONDS if method == "GET" else WRITE_TIMEOUT_SECONDS
+    timeout = GET_TIMEOUT_SECONDS if method.upper() == "GET" else WRITE_TIMEOUT_SECONDS
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         attempts_remaining = attempt < MAX_ATTEMPTS
@@ -320,28 +329,40 @@ def fetch_from_hosp(
             logger.warning(f"HOSP HTTP ERROR method={method} path={path} status={status_code} attempt={attempt}")
 
             transient_error = status_code in {500, 503}
-
-
             if method == "GET" and transient_error and attempts_remaining:
                 time.sleep(RETRY_DELAY_SECONDS)
                 continue
             return error_body, status_code
 
+        except (socket.timeout, TimeoutError):
+            status_code = 504
+            logger.error(f"HOSP TIMEOUT method={method} path={path} attempt={attempt}")
+            if method == "GET" and attempts_remaining:
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            return json.dumps({
+                "error": "Gateway Timeout",
+                "message": f"Upstream service HOSP failed to respond within {timeout} seconds."
+            }), status_code
+
         except urllib.error.URLError as error:
+            if isinstance(error.reason, socket.timeout):
+                status_code = 504
+                logger.error(f"HOSP TIMEOUT (URLError) method={method} path={path} attempt={attempt}")
+                if method == "GET" and attempts_remaining:
+                    time.sleep(RETRY_DELAY_SECONDS)
+                    continue
+                return json.dumps({
+                    "error": "Gateway Timeout",
+                    "message": f"Upstream connection timed out after {timeout} seconds."
+                }), status_code
+
             status_code = 502
             logger.error(f"HOSP CONNECTION ERROR method={method} path={path} attempt={attempt} err={error}")
             if method == "GET" and attempts_remaining:
                 time.sleep(RETRY_DELAY_SECONDS)
                 continue
             return json.dumps({"error": "Unable to contact HOSP"}), status_code
-
-        except TimeoutError:
-            status_code = 504
-            logger.error(f"HOSP TIMEOUT method={method} path={path} attempt={attempt}")
-            if method == "GET" and attempts_remaining:
-                time.sleep(RETRY_DELAY_SECONDS)
-                continue
-            return json.dumps({"error": "HOSP timed out"}), status_code
 
     return json.dumps({"error": "Unexpected proxy failure"}), 502
 
