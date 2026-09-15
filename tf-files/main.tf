@@ -54,8 +54,8 @@ resource "aws_dynamodb_table" "cache" {
   }
 
   global_secondary_index {
-    name = "ResourceIndex"
-    hash_key = "resource_path"
+    name            = "ResourceIndex"
+    hash_key        = "resource_path"
     projection_type = "KEYS_ONLY"
   }
 
@@ -110,7 +110,7 @@ resource "aws_iam_policy" "lambda_dynamodb_cache" {
         Resource = [
           aws_dynamodb_table.cache.arn,
           "${aws_dynamodb_table.cache.arn}/index/*"
-        ] 
+        ]
       },
       {
         Effect = "Allow"
@@ -284,7 +284,7 @@ resource "aws_lambda_function" "proxy_shield" {
   timeout          = 25 # Accommodates slow HOSP calls + retries
 
   # Protect Puma from thread exhaustion by capping concurrency
-  reserved_concurrent_executions = 50
+  reserved_concurrent_executions = 8
 
   vpc_config {
     subnet_ids = [
