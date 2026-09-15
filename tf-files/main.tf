@@ -238,37 +238,37 @@ variable "proxy_weight" {
   description = "Percentage of traffic to send to the Lambda proxy (0-100)"
 }
 
-resource "aws_lb_listener_rule" "canary_routing" {
-  listener_arn = data.aws_lb_listener.existing_http.arn
-  priority     = 10 # Avoids priority 1 collision
+# resource "aws_lb_listener_rule" "canary_routing" {
+#   listener_arn = data.aws_lb_listener.existing_http.arn
+#   priority     = 10 # Avoids priority 1 collision
 
-  action {
-    type = "forward"
+#   action {
+#     type = "forward"
 
-    forward {
-      target_group {
-        arn    = data.aws_lb_target_group.hosp.arn
-        weight = 100 - var.proxy_weight
-      }
+#     forward {
+#       target_group {
+#         arn    = data.aws_lb_target_group.hosp.arn
+#         weight = 100 - var.proxy_weight
+#       }
 
-      target_group {
-        arn    = aws_lb_target_group.lambda_proxy.arn
-        weight = var.proxy_weight
-      }
+#       target_group {
+#         arn    = aws_lb_target_group.lambda_proxy.arn
+#         weight = var.proxy_weight
+#       }
 
-      stickiness {
-        enabled  = false
-        duration = 1
-      }
-    }
-  }
+#       stickiness {
+#         enabled  = false
+#         duration = 1
+#       }
+#     }
+#   }
 
-  condition {
-    path_pattern {
-      values = ["/*"]
-    }
-  }
-}
+#   condition {
+#     path_pattern {
+#       values = ["/*"]
+#     }
+#   }
+# }
 
 # ==========================================
 # 6. LAMBDA FUNCTION & ENVIRONMENT
