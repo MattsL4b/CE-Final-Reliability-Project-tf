@@ -199,6 +199,18 @@ resource "aws_vpc_endpoint" "logs" {
   }
 }
 
+resource "aws_vpc_endpoint" "sqs" {
+  vpc_id = "vpc-080dbb0b7dc86503a"
+  service_name = "com.amazonaws.eu-west-2.sqs"
+  vpc_endpoint_type = "Interface"
+  subnet_ids = ["subnet-09f2ffa366a8abe67", "subnet-0fc0a94296b831a31"]
+  security_group_ids = [aws_security_group.lambda_sg.id]
+  private_dns_enabled = true
+
+  tags = {
+  Name = “sqs-vpc-endpoint”
+  }
+}
 
 # ==========================================
 # 5. ALB TARGET GROUP & CANARY ROUTING
@@ -270,6 +282,11 @@ variable "proxy_weight" {
 #   }
 # }
 
+resource "aws_sqs_queue" "revalidation_queue" {
+  name                       = "hosp-cache-revalidation-queue"
+  message_retention_seconds  = 86400
+  visibility_timeout_seconds = 30
+}
 # ==========================================
 # 6. LAMBDA FUNCTION & ENVIRONMENT
 # ==========================================
@@ -299,6 +316,7 @@ resource "aws_lambda_function" "proxy_shield" {
       CACHE_TABLE_NAME    = aws_dynamodb_table.cache.name
       HOSP_BACKEND_URL    = "http://172.31.39.164"
       CACHE_TTL_SECONDS   = "300" # Enforced as string
+      REVALIDATION_QUEUE_URL = aws_sqs_queue.revalidation_queue.url
       RETRY_WRITES_ON_5XX = "true"
     }
   }
@@ -306,6 +324,39 @@ resource "aws_lambda_function" "proxy_shield" {
   depends_on = [
     aws_iam_role_policy_attachment.lambda_vpc_access
   ]
+}
+
+resource "aws_iam_policy" "lambda_sqs_policy" {
+  name        = "hosp-lambda-sqs-revalidation-policy"
+  description = "Allows Lambda to send and process messages on the revalidation queue"
+
+  policy = jsondecode({
+    version = "2012-10-17"
+    statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:SendMessage",
+          "sqs:RecieveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes"
+        ]
+        Resource = aws_sqsqueue.revalidation_queue.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_sqs_attach" {
+  role          = aws_iam_role.lambda_exec.name
+  policy_arn    = aws_iam_policy.lambda_sqs_policy.arn
+}
+
+resource "aws_lambda_event_source_mapping" "sqs_trigger" {
+  event_source_arn   = aws_sqs_queue.revalidation_queue.arn
+  function_name      = aws_lambda_function.proxy_shield.arn
+  batch_size         = 2
+  enabled            = true
 }
 
 # ==========================================
