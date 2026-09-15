@@ -36,6 +36,7 @@ def get_ttl_config(path: str) -> tuple[int, int]:
 
 HOSP_BASE_URL = os.environ["HOSP_BACKEND_URL"].rstrip("/")
 CACHE_TABLE_NAME = os.environ["CACHE_TABLE_NAME"]
+REVALIDATION_QUEUE_URL = os.environ.get("REVALIDATION_QUEUE_URL")
 
 # MODIFIED: Removed fallback CACHE_TTL_SECONDS as we now use get_ttl_config()
 
@@ -45,7 +46,7 @@ RETRY_WRITES_ON_5XX = (
 # One normal request + one retry.
 MAX_ATTEMPTS = 2
 # HOSP has already been observed taking several seconds to respond.
-GET_TIMEOUT_SECONDS = 10
+GET_TIMEOUT_SECONDS = 5
 WRITE_TIMEOUT_SECONDS = 5
 # Small delay before retrying.
 RETRY_DELAY_SECONDS = 0.1
@@ -56,7 +57,7 @@ STALE_GRACE_SECONDS = 86400
 # Create the DynamoDB resource outside the handler for warm invocation reuse.
 dynamodb = boto3.resource("dynamodb")
 cache_table = dynamodb.Table(CACHE_TABLE_NAME)
-
+sqs = boto3.client("sqs")
 
 def extract_base_resource_path(path: str) -> str:
     """
@@ -67,6 +68,31 @@ def extract_base_resource_path(path: str) -> str:
     if not parts or not parts[0]:
         return "/"
     return f"/{'/'.join(parts[:2])}" if len(parts) >= 2 else f"/{parts[0]}"
+
+# Enqueues a revalidation task to SQS so the request returns immediately
+def trigger_asynchronous_revalidation(cache_key: str, path: str, query_params: dict, incoming_headers: dict, authorization: str):
+    if not REVALIDATION_QUEUE_URL:
+        logger.warning("REVALIDATION_QUEUE_URL not set; skipping async revalidation.")
+        return
+
+    payload = {
+        "cache_key": cache_key,
+        "path": path,
+        "query_params": query_params,
+        "incoming_headers": incoming_headers,
+        "authorization": authorization
+    }
+
+    try:
+        sqs.send_message(
+            QueueUrl=REVALIDATION_QUEUE_URL,
+            MessageBody=json.dumps(payload),
+            MessageDeduplicationId=cache_key if REVALIDATION_QUEUE_URL.endswith(".fifo") else None,
+            MessageGroupId="revalidation" if REVALIDATION_QUEUE_URL.endswith(".fifo") else None
+        )     
+        logger.info(f"ASYNC REVALIDATION ENQUEUED key={cache_key}")
+    except Exception as e:
+        logger.error(f"FAILED TO ENQUEUE ASYNC REVALIDATION key={cache_key} err={str(e)}")
 
 # Attempts to acquire a distributed lock in DynamoDB to prevent concurrent upstream requests.
 def acquire_lock(cache_key:str) -> bool:
@@ -112,10 +138,10 @@ def wait_for_cache(cache_key: str, poll_interval=0.2, max_retries=15):
 # ---------------------------------------------------------------------------
 
 def lambda_handler(event, context):
-    """
-    Main Lambda entry point.
-    Handles route-aware caching, serve-stale-on-error, and mutation invalidation.
-    """
+    # Process SQS worker events for async revalidation
+    if "Records" in event and event["Records"][0].get("eventSource") == "aws:sqs":
+        return process_sqs_revalidation(event, context)
+
     method = event.get("httpMethod", "GET").upper()
     path = event.get("path", "/")
     query_params = event.get("queryStringParameters") or {}
@@ -149,6 +175,17 @@ def lambda_handler(event, context):
                 cache_status="HIT"
             )
 
+        # 2. Stale Cache Hit - Return instantly & trigger background revalidation
+        if cached_item and "data" in cached_item:
+            logger.info(f"CACHE STALE - Serving stale data and dispatching async revalidation key={cache_key}")
+            trigger_asynchronous_revalidation(cache_key, path, query_params, incoming_headers, authorization)
+            return build_response(
+                status_code=200,
+                body=cached_item["data"],
+                cache_status="STALE_ASYNC_REVALIDATING"
+            )
+
+        # Request Collapsing for Cold Misses
         got_lock = acquire_lock(cache_key)
         if not got_lock:
             logger.info(f"LOCK HELD BY ANOTHER REQUEST - Polling cache key={cache_key}")
@@ -161,32 +198,7 @@ def lambda_handler(event, context):
                     cache_status="HIT"
                 )
         try:
-            # 2. Stale Cache Hit - Try upstream; fallback instantly to stale data if upstream fails
-            if cached_item and "data" in cached_item:
-                logger.info(f"CACHE STALE - Fetching revalidation key={cache_key}")
-                soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
-
-                upstream_body, upstream_status = fetch_from_hosp(
-                    method=method, path=path, query_params=query_params,
-                    incoming_headers=incoming_headers, authorization=authorization, body=body, context=context
-                )
-
-                if upstream_status == 200:
-                    save_to_cache(cache_key, resource_base_path, upstream_body, soft_ttl_sec, hard_ttl_sec)
-                    return build_response(
-                        status_code=200,
-                        body=upstream_body,
-                        cache_status="REVALIDATED"
-                    )
-
-                logger.warning(f"Revalidation failed (status={upstream_status}). Serving stale cache")
-                return build_response(
-                    status_code=200,
-                    body=cached_item["data"],
-                    cache_status="STALE"
-                )
-
-            # 3. Cache Cold Miss - Fetch upstream and write to cache
+            # 3. Cache Cold Miss - Synchronous fetch (first time only)
             logger.info(f"CACHE COLD MISS method={method} path={path} key={cache_key}")
             soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
 
@@ -207,7 +219,7 @@ def lambda_handler(event, context):
                 status_code=upstream_status,
                 body=upstream_body or json.dumps({
                     "error": "Gateway Timeout" if upstream_status == 504 else "Upstream service failure",
-                    "message": f"Upstream HOSP service failed to respond within timeout window."
+                    "message": "Upstream HOSP service failed to respond within timeout window."
                 }),
                 cache_status="MISS"
             )     
@@ -215,9 +227,7 @@ def lambda_handler(event, context):
             if got_lock: 
                 release_lock(cache_key)    
 
-    # -----------------------------------------------------------------------
-    # NON-GET MUTATIONS (POST, PUT, PATCH, DELETE)
-    # -----------------------------------------------------------------------
+    # NON-GET MUTATIONS
     response_body, status_code = fetch_from_hosp(
         method=method,
         path=path,
@@ -228,7 +238,6 @@ def lambda_handler(event, context):
         context=context
     )
 
-    # Invalidate cache if write succeeded
     if status_code in {200, 201, 204}:
         invalidate_related_cache(path)
 
@@ -237,6 +246,42 @@ def lambda_handler(event, context):
         body=response_body,
         cache_status="BYPASS"
     )
+# ---------------------------------------------------------------------------
+# SQS WORKER EXECUTION
+# ---------------------------------------------------------------------------
+
+def process_sqs_revalidation(event, context):
+    """Processes background revalidation jobs triggered by SQS."""
+    for record in event["Records"]:
+        try:
+            payload = json.loads(record["body"])
+            cache_key = payload["cache_key"]
+            path = payload["path"]
+            query_params = payload["query_params"]
+            incoming_headers = payload["incoming_headers"]
+            authorization = payload["authorization"]
+
+            logger.info(f"EXECUTING BACKGROUND REVALIDATION key={cache_key}")
+            soft_ttl_sec, hard_ttl_sec = get_ttl_config(path)
+            resource_base_path = extract_base_resource_path(path)
+
+            upstream_body, upstream_status = fetch_from_hosp(
+                method="GET",
+                path=path,
+                query_params=query_params,
+                incoming_headers=incoming_headers,
+                authorization=authorization,
+                context=context
+            )
+
+            if upstream_status == 200:
+                save_to_cache(cache_key, resource_base_path, upstream_body, soft_ttl_sec, hard_ttl_sec)
+                logger.info(f"BACKGROUND REVALIDATION SUCCESS key={cache_key}")
+            else:
+                logger.warning(f"BACKGROUND REVALIDATION FAILED status={upstream_status} key={cache_key}")
+
+        except Exception as e:
+            logger.error(f"ERROR PROCESSING SQS REVALIDATION RECORD: {str(e)}")
 
 # ---------------------------------------------------------------------------
 # CACHE KEY GENERATION
